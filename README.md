@@ -19,6 +19,9 @@
 | 冷启动（插拔 / 复位后） | ✅ 10s（7s USB 枚举 + 2.7s init），一次成功 |
 | 整机重启后开机 | ✅ 一次 probe 成功，`probe_failed=0` |
 | 真机重启验证 | ✅ 重启后 `demux0 dvr0 frontend0 net0` 齐全 |
+| 命令通道并发压测（4 线程同一 fd，30s） | ✅ 1488 次 `FE_READ_STATUS`，0 错误 |
+| 长时间持续读状态 | ✅ 5 分钟 4 线程 14412 次，0 超时 / 0 stall / 0 错位 |
+| 通道卡死后自愈（注入故障验证） | ✅ 自动复位重新枚举，节点自己回来，**不用拔插** |
 
 设备上实测：
 
@@ -203,6 +206,65 @@ probe
 
 因为 probe 现在能正确处理热芯片，`reboot_notifier` 已经删掉 —— 重启前不需要做任何事。
 
+## 关键坑 4：跑一段时间"不定时挂死"，必须拔插才能恢复
+
+这是实际使用中最影响体验的问题：驱动加载正常、能出节点、能锁台，但跑几个小时
+（有时几分钟）之后就不动了，画面冻结、状态不再更新，`rmmod`/`insmod` 都没用，
+**只有拔掉 USB 重新插**才恢复。
+
+根因不在"稳定性跑久了劣化"，而在命令通道（`0x01` 写 + `0x82` 读）的四个结构性缺陷：
+
+1. **两步事务没有互斥。** `smit_set()` / `smit_tuner_stat()` 都是"OUT 写 5+N 字节，
+   再从 `0x82` 读回一包"。`dvb_frontend_ioctl` 这一层没有按设备加锁，同一 fd 被多个
+   线程同时 ioctl 时（播放器轮询状态 + 另一线程调 `FE_SET_FRONTEND`）两个 OUT 包会交错。
+   → 加 `smit_cmd_lock`，一个事务（OUT+IN）整体独占。
+
+2. **一次 IN 超时就永久错位。** 这是"不定时"的真正来源，不需要任何并发：某次读应答
+   超时（芯片正好在忙），那条应答还躺在 IN 管道里，下一条命令读到的是它的**上一条**
+   应答。之后整条通道稳定地偏移一格，`read_status` 永远拿到旧数据 —— 表现就是
+   "状态不再更新、画面冻结"，而且自己好不了。
+   → 超时 / `tag` 错位后置 `resync_pending`，下次事务前 `smit_drain_in()` 把 IN 管道
+   抽干并 `clear_halt`，从干净边界重新开始。
+
+3. **端点 stall 之后从不清 halt。** 一旦某次传输拿到 `-EPIPE`，之后每一次传输都立刻
+   返回 `-EPIPE`，主机侧没有任何东西能让它恢复。
+   → `smit_bulk_out/in` 遇到 `-EPIPE` 先 `usb_clear_halt()` 再重试一次。
+
+4. **重试只有次数上限、没有时间上限。** `smit_check()` 原来只判 `cnt > checkcount`，
+   每次尝试还含两个 500ms 超时；`checkcount=300` 时一条 ioctl 最坏能卡几十秒，
+   应用整个卡在 ioctl 里。
+   → 预算改成 `1s + checkcount*10ms`（上限 6s），且在循环头上就判，别等跑完一轮。
+
+还有一个"看起来像挂死"的坑在前端层：`icast_fe_read_status()` 读失败时直接
+`return 0`，**没有写 `*status`**。上层 `dvb_frontend_ioctl()` 里那个变量是栈上的
+未初始化值，随便带着 `FE_HAS_LOCK` 位，于是一次读失败之后播放器会一直认为
+"还锁着"，对着一动不动的画面永远不恢复。→ 进函数先 `*status = 0`。
+
+最后加了一层**自愈**兜底：连续 3 次事务在传输层失败就认为芯片卡死，
+在 workqueue 里发硬件复位让芯片重新枚举（不能在 ioctl 上下文里同步做，那等于
+在还没退出时拆自己的设备），`probe` 因此走完整冷启动，节点自己回来 —— 不需要拔插。
+复位本身带死循环保护：连续 3 次复位都没换来一次成功 probe 就停手
+（`reset_attempts` 在每次 probe 成功时清零）。
+
+实测（`/sys/module/dvb_usb_smit/parameters/stats` 计数）：
+
+| 场景 | 结果 |
+|---|---|
+| 4 线程同 fd 压 `FE_READ_STATUS` 30s | 1488 次，0 错误，`timeout=0 epipe=0 resync=0` |
+| 同上跑 5 分钟 | 14412 次，0 错误，最大延迟 120ms，计数全 0 |
+| 注入 3 次传输层失败（`fault_test=3`） | `recover=1`，`devnum 3 -> 4`，复位后 `wake answered 1 attempt(s) 0 ms`，节点自动回来 |
+
+`stats` 是这个问题的诊断入口，以后再挂死先读它：
+
+```
+# cat /sys/module/dvb_usb_smit/parameters/stats
+ok=2932 timeout=0 epipe=0 resync=0 recover=1 err_streak=0
+```
+
+`timeout` 涨 → 芯片不再应答（业务层）；`epipe` 涨 → 端点 stall 过但被 `clear_halt`
+救回来了；`resync` 涨 → 出现过错位并被冲刷修正；`recover` 涨 → 触发过自愈复位。
+四个都不动而画面临时断 → 问题在 TS 数据流（`0x84`），不在这条命令通道。
+
 ## 目录
 
 ```
@@ -275,5 +337,16 @@ insmod dvb-usb-smit.ko trace=1          # 打印 smit_init 每条命令的耗时
 insmod dvb-usb-smit.ko diag_probe=1     # 打印描述符 + 5 个 vendor control 请求的应答
 insmod dvb-usb-smit.ko reset_on_exit=1  # 卸载时复位芯片，强制下一次 probe 走冷启动
 insmod dvb-usb-smit.ko skip_wake=1      # 跳过唤醒直接跑初始化（复现"热芯片被 init 打死"）
+insmod dvb-usb-smit.ko autorecover=0    # 关掉命令通道卡死时的自动复位（默认开）
+```
+
+运行时可直接读写（不用重新 insmod）：
+
+```sh
+# 链路健康度，排查"挂着不动"先看这个
+cat /sys/module/dvb_usb_smit/parameters/stats
+
+# 故障注入：让接下来 N 条命令直接返回 -ETIMEDOUT，验证自愈链路
+echo 3 > /sys/module/dvb_usb_smit/parameters/fault_test
 ```
 

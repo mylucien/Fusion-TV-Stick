@@ -103,7 +103,16 @@ static struct dvb_usb_device_properties icast_properties = {
 		{
 		.num_frontends = 1,
 		.fe = {{
-			.caps = DVB_USB_ADAP_HAS_PID_FILTER,
+			/* 这里原来声明了 DVB_USB_ADAP_HAS_PID_FILTER，但驱动从来没
+			 * 实现过 .pid_filter / .pid_filter_ctrl —— 声明的是个不存在
+			 * 的能力。后果在 dvb-usb-init.c 里：设备以 Full-speed 枚举时
+			 * （caps 有 HAS_PID_FILTER）会走 pid_filtering=1 分支，
+			 * max_feed_count = pid_filter_count，而后者没赋值就是 0；
+			 * 再往下 demux.filternum = 0 —— 节点出来了却一个 filter 都
+			 * 开不了。去掉这个声明后，Full-speed 会被明确拒绝
+			 * （"cannot be run on USB1.1 port"），High-speed 行为不变
+			 * （pid_filtering=0，走软件 demux，max_feed_count=255）。 */
+			.caps = 0,
 			.frontend_attach  = icast_frontend_attach,
 			.stream = {
 				.type = USB_BULK,
@@ -139,6 +148,7 @@ static struct dvb_usb_device_properties icast_properties = {
 #define SMIT_WAKE_BUDGET_MS	1000
 #define SMIT_WAKE_TIMEOUT_MS	500
 #define SMIT_WAKE_BUF_SIZE	512
+#define SMIT_DIAG_BUF_SIZE	64
 
 static int smit_wake(struct usb_device *udev)
 {
@@ -154,17 +164,17 @@ static int smit_wake(struct usb_device *udev)
 	deadline = t0 + msecs_to_jiffies(SMIT_WAKE_BUDGET_MS);
 
 	for (;;) {
+		int pipe = usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND);
+
 		attempt++;
 
 		memcpy(buf, wake, sizeof(wake));
-		ret = usb_bulk_msg(udev,
-			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
-			buf, sizeof(wake), &size, SMIT_WAKE_TIMEOUT_MS);
+		ret = usb_bulk_msg(udev, pipe, buf, sizeof(wake), &size,
+				   SMIT_WAKE_TIMEOUT_MS);
 		if (!ret) {
-			ret = usb_bulk_msg(udev,
-				usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
-				buf, SMIT_WAKE_BUF_SIZE, &size,
-				SMIT_WAKE_TIMEOUT_MS);
+			pipe = usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE);
+			ret = usb_bulk_msg(udev, pipe, buf, SMIT_WAKE_BUF_SIZE,
+					   &size, SMIT_WAKE_TIMEOUT_MS);
 			/* 回包长度不确定：设备给的数据比缓冲区多只会报
 			 * EOVERFLOW，这时包其实已经收到了，不算失败 */
 			if (ret == -EOVERFLOW)
@@ -185,17 +195,13 @@ static int smit_wake(struct usb_device *udev)
 			break;
 
 		/* 只有真 stall(-EPIPE) 才值得付 clear_halt 的代价。
-		 * 原来这里是每轮无条件清两次，而 usb_clear_halt 内部发的是
-		 * CLEAR_FEATURE 控制请求、超时用 USB_CTRL_GET_TIMEOUT（5s）：
+		 * 原来这里是每轮无条件清两个端点，而 usb_clear_halt 内部发的是
+		 * CLEAR_FEATURE 控制请求、超时用 USB_CTRL_SET_TIMEOUT（5s）：
 		 * 芯片连 control 都不应答时每轮固定烧 10s，1s 的预算形同废纸
 		 * （实测死透的芯片能把这里拖到几十秒）。超时的时候端点并没有
-		 * halt，清它纯属自找 5s。 */
-		if (ret == -EPIPE) {
-			usb_clear_halt(udev,
-				usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
-			usb_clear_halt(udev,
-				usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE));
-		}
+		 * halt，清它纯属自找 5s。现在也只清真正出错的那个端点。 */
+		if (ret == -EPIPE)
+			usb_clear_halt(udev, pipe);
 
 		if (time_after_eq(jiffies, deadline))
 			break;
@@ -211,7 +217,17 @@ static int smit_wake(struct usb_device *udev)
 }
 
 /* 采集冷/热芯片的描述符与 vendor control 应答（diag_probe=1）。
- * 实测两者完全一致，没有区分度，留着只为以后换芯片/固件时快速复测。 */
+ *
+ * 缓冲区必须用 kmalloc，不能是栈数组：hcd_map_urb_for_dma() 对栈上的
+ * transfer_buffer 直接 WARN_ONCE 并返回 -EAGAIN，请求根本发不出去。
+ * 真机实拍（diag_probe=1）：
+ *   usb 1-1: diag: bcdUSB=0200 ...
+ *   transfer buffer is on stack
+ *   usb 1-1: diag: ctrl req=a0 val=0000 -> -11
+ *   ...
+ * 五个请求全是 -11，一个字节都没到设备。所以之前"vendor control 请求
+ * 冷热完全一致、零区分度"的结论是假的 —— 那些 -11 是主机侧映射失败，
+ * 不是设备的答复。smit_ping 当年踩过同一个坑（见上面的注释）。 */
 static void smit_diag(struct usb_device *udev)
 {
 	const struct usb_device_descriptor *d = &udev->descriptor;
@@ -222,8 +238,14 @@ static void smit_diag(struct usb_device *udev)
 		{ 0xC0, 0x82, 0x0000, 0, 64 },
 		{ 0xC0, 0xFF, 0x0000, 0, 64 },
 	};
-	u8 buf[64];
+	u8 *buf;
 	int i, ret;
+
+	buf = kmalloc(SMIT_DIAG_BUF_SIZE, GFP_KERNEL);
+	if (!buf) {
+		dev_warn(&udev->dev, "diag: no memory, skipped\n");
+		return;
+	}
 
 	dev_info(&udev->dev,
 		 "diag: bcdUSB=%04x bcdDevice=%04x id=%04x:%04x cfg=%u cls=%02x/%02x/%02x iMan=%u iProd=%u iSer=%u speed=%d\n",
@@ -235,7 +257,7 @@ static void smit_diag(struct usb_device *udev)
 	for (i = 0; i < ARRAY_SIZE(t); i++) {
 		int n = 0;
 
-		memset(buf, 0, sizeof(buf));
+		memset(buf, 0, SMIT_DIAG_BUF_SIZE);
 		ret = usb_control_msg(udev,
 			usb_rcvctrlpipe(udev, 0), t[i].req, t[i].type,
 			t[i].val, t[i].idx, buf, t[i].len, 300);
@@ -246,12 +268,14 @@ static void smit_diag(struct usb_device *udev)
 	}
 
 	if (d->iProduct) {
-		ret = usb_string(udev, d->iProduct, buf, sizeof(buf) - 1);
+		ret = usb_string(udev, d->iProduct, buf, SMIT_DIAG_BUF_SIZE - 1);
 		if (ret > 0) {
 			buf[ret] = 0;
 			dev_info(&udev->dev, "diag: iProduct=\"%s\"\n", buf);
 		}
 	}
+
+	kfree(buf);
 }
 
 /* 探针：初始化序列的第一条命令本来就是 "req 0x82 读 1 字节" 的只读查询。
@@ -268,9 +292,14 @@ static int smit_ping(struct usb_device *udev)
 	return smit_set(udev, 0x82, cmd0, 1, 0);
 }
 
-/* 模块加载时在总线上找到的、确认已初始化的芯片的 devnum。
- * devnum 每次重新枚举都会变，所以它同时充当"这个芯片还是不是当年那个"的凭据。 */
+/* 模块加载时在总线上找到的、确认已初始化的芯片的身份。
+ * devnum 每次重新枚举都会变，所以它同时充当"这个芯片还是不是当年那个"的凭据。
+ *
+ * 但 devnum 只在**一条总线**内唯一：两个 USB 控制器上各挂一个同型号设备时
+ * 可能出现相同的 devnum，只看它就会把另一个冷芯片误判成热芯片（跳过
+ * 唤醒和初始化，节点出来了前端全哑）。所以连 busnum 一起记。 */
 static int smit_warm_devnum = -1;
+static int smit_warm_busnum = -1;
 
 /* 复位是最后手段，也可能是死循环的入口：复位 -> 重新枚举 -> probe 又失败 ->
  * 再复位，每轮 7s。每次 probe 成功都会把计数清零；连续 SMIT_RECOVER_MAX_CONSEC
@@ -352,6 +381,7 @@ static void smit_recover_work_fn(struct work_struct *work)
 			/* 复位后 devnum 会变，下一次 probe 因此不会命中"热芯片复用"，
 			 * 而是走完整冷启动。 */
 			smit_warm_devnum = -1;
+			smit_warm_busnum = -1;
 			if (smit_reset_allowed())
 				pr_warn("dvb_usb_smit: recovery reset returned %d\n",
 					smit_reset(udev));
@@ -391,11 +421,13 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	if (smit_diag_probe)
 		smit_diag(udev);
 
-	if (smit_warm_devnum == (int)udev->devnum) {
+	if (smit_warm_devnum == (int)udev->devnum &&
+	    smit_warm_busnum == (int)udev->bus->busnum) {
 		dev_info(&udev->dev,
-			 "chip is already initialized (devnum %d), skipping wake + init\n",
-			 udev->devnum);
+			 "chip is already initialized (bus %d devnum %d), skipping wake + init\n",
+			 udev->bus->busnum, udev->devnum);
 		smit_warm_devnum = -1;	/* 只复用一次 */
+		smit_warm_busnum = -1;
 		goto register_device;
 	}
 
@@ -430,8 +462,10 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	 * 整套 init 全 -110，然后触发自愈复位、再撞、开始循环。
 	 * 固件启动时间在软复位后尤其不稳，所以这里留一个可调的 settle 间隔。
 	 * 代价只在冷路径上（插拔 / 复位后），热复用完全不受影响。 */
-	if (smit_settle_ms)
-		msleep(smit_settle_ms);
+	/* settle_ms 是 0644 可写的，负数会变成天文数字：msleep 的入参是
+	 * unsigned int，-1 就是 4294967295ms（约 49 天）。顺手夹一下。 */
+	if (smit_settle_ms > 0)
+		msleep(smit_settle_ms > 5000 ? 5000 : (unsigned int)smit_settle_ms);
 do_init:
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {
@@ -480,6 +514,7 @@ static void smit_disconnect(struct usb_interface *intf)
 	 * 节点出来了但前端全哑（每条命令都超时），再靠自愈绕一圈才恢复。
 	 * 自愈路径上本来自己会清，但外部拔插不会，所以必须在这里清。 */
 	smit_warm_devnum = -1;
+	smit_warm_busnum = -1;
 
 	dvb_usb_device_exit(intf);
 
@@ -517,10 +552,16 @@ static int __init smit_module_init(void)
 		smit_in_probe = true;
 		ret = smit_ping(udev);
 		smit_in_probe = false;
-		if (!smit_is_transport_err(ret)) {
+		if (ret == -ENOMEM) {
+			/* 主机侧 kmalloc 失败，完全没碰到设备。既不能当"热芯片"
+			 * 复用（没验证过），也不能当"冷芯片"去复位（芯片可能是好的，
+			 * 白搭 7s 重枚举）。放过去，让 probe 走完整的唤醒+init。 */
+			pr_info("dvb_usb_smit: ping out of memory, leaving it to probe\n");
+		} else if (!smit_is_transport_err(ret)) {
 			smit_warm_devnum = udev->devnum;
-			pr_info("dvb_usb_smit: chip already initialized (devnum %d), will reuse it\n",
-				udev->devnum);
+			smit_warm_busnum = udev->bus->busnum;
+			pr_info("dvb_usb_smit: chip already initialized (bus %d devnum %d), will reuse it\n",
+				udev->bus->busnum, udev->devnum);
 		} else {
 			int i;
 
@@ -554,10 +595,23 @@ static int __init smit_module_init(void)
 
 static void __exit smit_module_exit(void)
 {
-	/* 先掐掉可能排着队的自愈复位：它持有 udev 的引用，
-	 * 不能让它在模块卸载之后还去碰设备 */
-	cancel_work_sync(&smit_recover_work);
+	/* 顺序很重要：先摘驱动，之后不会再有 probe/ioctl 进来排新的自愈任务。
+	 * 反过来（先 cancel 再 deregister）留着一个口子：cancel 返回之后到
+	 * deregister 之间还可能排进一个新 work，它会在模块代码已经卸载之后
+	 * 才执行 —— 直接跳进已释放的代码段。 */
 	usb_deregister(&smit_driver);
+
+	/* cancel_work_sync 返回 true 表示任务是被取消的，fn 根本没跑，
+	 * 那它持有的 usb 引用就得我们自己还。不还的话这个 usb_device 的
+	 * 引用计数永远多一份：设备拔掉后结构体释放不掉，smit_recover_queued
+	 * 也停在 1。正在执行的情况它会等 fn 跑完，fn 自己会 usb_put_dev。 */
+	if (cancel_work_sync(&smit_recover_work)) {
+		if (smit_recover_udev) {
+			usb_put_dev(smit_recover_udev);
+			smit_recover_udev = NULL;
+		}
+		atomic_set(&smit_recover_queued, 0);
+	}
 }
 
 module_init(smit_module_init);

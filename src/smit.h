@@ -37,7 +37,7 @@ extern bool smit_in_probe;
 void smit_schedule_recovery(struct usb_device *udev);
 
 int smit_reset(struct usb_device *udev);
-int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag);
+int smit_set(struct usb_device *udev, u8 req, u8 *data, unsigned int len, int need_complete_flag);
 int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount);
 int smit_init(struct usb_device *udev, u8 *dtmb);
 

@@ -167,8 +167,21 @@ disconnect 复位 + reboot notifier，把 reload 时间定格在 14s。**这个�
 
 判定"冷还是热"试过三条路，前两条都失败，记下来免得再踩：
 
-1. **设备描述符 / 字符串 / vendor control 请求** —— 冷热完全一致
-   （`bcdDevice=0200`、`iProduct="DONGLE"`、几个 `0xC0` 请求一律 `-11`），零区分度。
+1. **设备描述符 / 字符串 / vendor control 请求** —— 描述符和字符串确实一样
+   （`bcdDevice=0200`、`iProduct="DONGLE"`），但**"vendor 请求零区分度"这个结论是假的**。
+   那几个 `0xC0` 请求的 `-11` 根本不是设备的答复：`diag_probe=1` 当时把栈上的
+   `u8 buf[64]` 直接交给了 `usb_control_msg`，`hcd_map_urb_for_dma()` 对栈缓冲区
+   `WARN_ONCE("transfer buffer is on stack")` 并返回 `-EAGAIN`，**请求一个字节都没发出去**。
+   修正前的真机日志：
+   ```
+   usb 1-1: diag: bcdUSB=0200 bcdDevice=0200 id=29df:0001 ... speed=3
+   transfer buffer is on stack
+   usb 1-1: diag: ctrl req=a0 val=0000 -> -11
+   usb 1-1: diag: ctrl req=01 val=0000 -> -11
+   ...
+   ```
+   现在 `smit_diag()` 改用 `kmalloc` 缓冲区。也就是说这条路**从来没被真正测过**，
+   想找更简单的冷热判据，值得用它重测一遍。
 2. **在 `probe` 里用 bulk 命令探活** —— 冷芯片收不到应答时，探针的 5 个字节
    已经留在它的 OUT FIFO 里，紧跟着的唤醒包被拼成畸形命令，握手必失败
    （加大到 4s / 10 次重发也冲不掉）。probe 失败又触发复位 → 重枚举 → 再探测 →
@@ -218,21 +231,30 @@ probe
 
 根因不在"稳定性跑久了劣化"，而在命令通道（`0x01` 写 + `0x82` 读）的四个结构性缺陷：
 
-1. **两步事务没有互斥。** `smit_set()` / `smit_tuner_stat()` 都是"OUT 写 5+N 字节，
-   再从 `0x82` 读回一包"。`dvb_frontend_ioctl` 这一层没有按设备加锁，同一 fd 被多个
-   线程同时 ioctl 时（播放器轮询状态 + 另一线程调 `FE_SET_FRONTEND`）两个 OUT 包会交错。
-   → 加 `smit_cmd_lock`，一个事务（OUT+IN）整体独占。
+1. ~~两步事务没有互斥~~ —— **这条归因是错的，已撤回。**
+   `dvb_frontend_do_ioctl()` 在 `fepriv->sem` 下调 `dvb_frontend_handle_ioctl()`，
+   状态线程（每 100ms 的 `read_status`）也在同一把信号量下（`dvb_frontend.c`），
+   而且这把信号量是 per-frontend 而不是 per-fd。**所有前端操作本来就完全串行**，
+   同一个 OUT 包被两个调用者交错在结构上就不可能发生。
+   → `smit_cmd_lock` 仍然保留：它唯一真正起作用的是 `probe`/自愈复位路径，
+   那条路径不受 `fepriv->sem` 保护，确实可能和 ioctl 撞上。但别再把它当成
+   "挂死的解药"——**以后再出现挂死，不要因为"已经加了锁"就把并发排除**。
+   当年那个"4 线程同 fd 压 20s，0 错误"的测试，测的其实是核心的 `fepriv->sem`，
+   不是这把锁。真正有效的是下面第 2/3/4 条加上自愈复位。
 
 2. **一次 IN 超时就永久错位。** 这是"不定时"的真正来源，不需要任何并发：某次读应答
    超时（芯片正好在忙），那条应答还躺在 IN 管道里，下一条命令读到的是它的**上一条**
    应答。之后整条通道稳定地偏移一格，`read_status` 永远拿到旧数据 —— 表现就是
    "状态不再更新、画面冻结"，而且自己好不了。
    → 超时 / `tag` 错位后置 `resync_pending`，下次事务前 `smit_drain_in()` 把 IN 管道
-   抽干并 `clear_halt`，从干净边界重新开始。
+   抽干，从干净边界重新开始。注意这里**只在真 stall 时**才 `clear_halt`（见第 3 条）。
 
 3. **端点 stall 之后从不清 halt。** 一旦某次传输拿到 `-EPIPE`，之后每一次传输都立刻
    返回 `-EPIPE`，主机侧没有任何东西能让它恢复。
-   → `smit_bulk_out/in` 遇到 `-EPIPE` 先 `usb_clear_halt()` 再重试一次。
+   → 遇到 `-EPIPE` 先 `usb_clear_halt()` 再重试一次。但代价要算清楚：
+   `usb_clear_halt()` 是一条 `CLEAR_FEATURE` 控制请求（不管端点是否真 halt 都会发），
+   超时 `USB_CTRL_SET_TIMEOUT = 5s`。所以①只在**确实还会再重试**时才清，
+   最后一次失败后再清纯属白等；②只清**出错的那个端点**，不要收发一起清。
 
 4. **重试只有次数上限、没有时间上限。** `smit_check()` 原来只判 `cnt > checkcount`，
    每次尝试还含两个 500ms 超时；`checkcount=300` 时一条 ioctl 最坏能卡几十秒，
@@ -381,6 +403,86 @@ P2 三处：`__smit_set` 增加 `len > sizeof(data)` 校验（它是导出接口
 | probe 期间自愈抑制 | 3 轮冷启动 `recover` 始终为 0，没有被误触发 |
 
 `ok` 计数从 3 涨到 1953，正好等于 975 次 `read_status` × 每条 2 条命令 —— 原子计数准确。
+
+## 关键坑 6：第二轮审查（频率缓存被污染 / 两条归因被推翻）
+
+第二轮是纯代码 + 内核源码对照的方式做的，没有再靠真机撞。核心收获是
+**"我们以为的根因"里有一条是错的，而"看着最无害的一行"反而是最严重的 bug**。
+
+### P0-1 频率缓存被设备单位污染，失锁后再也调不回来
+
+`icast_fe_get_frontend()` 无视 `props` 参数，直接写 `fe->dtv_property_cache`
+（上游原版就是这样，我们照抄了）。核对 6.18 内核后确认两条路径待遇完全不同：
+
+- `FE_GET_FRONTEND` → `dvb_get_frontend()` 先 `memcpy` 一份副本再交给驱动，
+  注释写明是防"驱动乱写缓存"。驱动绕过副本，结果**用户读到的是旧值，
+  真实缓存却被改写**。
+- `dvb_frontend_add_event()` → 直接把真实 `&fe->dtv_property_cache` 传进来，
+  而且**每次锁定状态变化都会调**，不需要应用参与。
+
+而 `priv->frequency` 有两个写入方、两种单位：`set_frontend` 存 Hz（下发时 `/1000`），
+`read_status` 锁定时用设备回报值覆盖（同一结构的回读字段，几乎必然是 kHz）。
+于是：锁定 → `read_status` 把 `priv->frequency` 改成 474000 → `add_event` 调
+`get_frontend` 把它写进 `cache.frequency` → 失锁后 `swzigzag_autotune` 以
+`c->frequency` 为基准下发 → 往 **474 kHz** 调，永远锁不上。
+这正好解释了"画面卡住不恢复"。
+
+修法：`get_frontend` 只写 `props`；`read_status` 不再覆盖 `priv->frequency`；
+`priv->frequency` 只保留一个单位（Hz）、一个写入方（`set_frontend`），
+新增 `tuned` 标志确保只在真的调谐成功过之后才上报。
+
+> 真机确认单位需要能收台的频点。不过**修复不依赖这个结论**：
+> 只要干掉"两个单位混在一个字段"，无论设备回报的是 Hz 还是 kHz 都不会再污染缓存。
+
+### P0-2 DTMB/DVB-C 判定会静默退化成"仅 DVB-C"
+
+`strstr(buf + 18, "DTMB:Y")` 用的 `buf` 是整个 init 序列复用的同一个数组。
+cmd14 之后的 `smit_tuner_stat` 一旦被跳过或失败，里面留着的是**上一条（cmd8）
+的应答**，必然匹配不到 → 双模芯片被判成单模，probe 只打一句 `continuing`，
+没有任何提示。
+
+修法：先 `memset`，且只认明确读到的内容 —— `"DTMB:N"` 降级、`"DTMB:Y"` 升双模、
+**读不到就保持传入的默认值**（双模 ops 是单模的超集，判错代价最小）。
+
+### P0-3 传输层错误被协议错误掩盖
+
+`SMIT_DO` 原来只记"第一个负返回值"。如果先来一条协议错误（`-1003`），
+后面链路彻底断了（一串 `-110`）也不会覆盖 `err`，于是"跳过剩余命令"的逻辑
+永远不触发：六条命令白跑，返回 `-1003`，probe 判成"非传输错误，继续"，
+**注册一个已经死掉的设备**。修法：传输层错误无条件覆盖。
+
+### P1 四条
+
+| 问题 | 后果 | 修法 |
+|---|---|---|
+| `-EOVERFLOW` 当成功但没把数据拷回 | 调用方拿到**自己发出去的请求包**当应答解析（`usb_start_wait_urb` 在 EOVERFLOW 时已经回填 `actual_length`，数据也在缓冲区里） | `ret == -EOVERFLOW` 也 `memcpy`；`pipe & 0x80` 换成 `usb_pipein()` |
+| `-EPIPE` 重试里最后一次失败后仍 `clear_halt` | 收发两端各清一次，芯片不应答时白烧 2×5s | 只在还会重试时才清，且只清出错的那个端点 |
+| `smit_diag()` 用栈缓冲区 | `usb_control_msg` 全部 `-EAGAIN`，**请求根本没发出去**；"vendor 请求零区分度"的结论因此不成立 | 改 `kmalloc` |
+| `module_exit` 先 `cancel_work_sync` 再 `usb_deregister` | 被取消的 work 不会跑，它持有的 `usb_get_dev` 永不释放；且 deregister 之前还可能排进新 work | 换顺序 + 取消时补 `usb_put_dev` |
+
+### P2 六条
+
+- `set_frontend` 不看返回值、永远 `return 0` —— 链路死了应用也看到"调谐成功"，
+  `priv` 还会被更新成假状态。改成失败上抛且不更新。
+- 信号强度用魔数换算、没有 clamp —— 实测算过：`x=101` 得 654、`x=255` 得 36042
+  （`x*65535/100` 超出 16 位被截断），表现为"信号一下掉到几乎没有"。加 clamp。
+- `__smit_check()` 的返回值在 `__smit_tuner_stat()` 里被丢弃 —— 完成标志轮询
+  在传输层挂掉时不算失败，自愈不会启动。
+- `smit_note()` 把 `-ENOMEM` 也算链路故障 —— 连续几次内存紧张就能把好芯片复位；
+  `module_init` 的 ping 返回 `-ENOMEM` 还会被当成冷芯片去复位。
+- `len > sizeof(smit.data)` 这条校验永远为假（`len` 是 `u8`，上限 255）。
+  改成 `unsigned int` 参数 + 同时挡 `> 0xFF`（datalen 字段是 `u8`）。
+- `icast_fe_init` 不清 `priv->lock`；`read_status` 只报 `SIGNAL|LOCK`（缺
+  `CARRIER/SYNC/VITERBI`，个别应用会认为没锁）；`settle_ms` 可写负数（→ 巨大
+  `msleep`）；`smit_warm_devnum` 只比 devnum 不比 busnum；声明了
+  `HAS_PID_FILTER` 却没实现 `.pid_filter` 回调（Full-speed 下 `max_feed_count=0`，
+  demux 一个 filter 都没有）。全部修掉，`pid_filter` 那个直接去掉声明。
+
+### 一条被撤回的归因
+
+"跑一阵子挂死 = 没有互斥导致 OUT 包交错"——**错**。详见「关键坑 4」第 1 条。
+前端操作被核心的 `fepriv->sem` 完全串行化，那次 4 线程压测测的是核心的信号量。
+锁留着有用（护 `probe`/自愈路径），但它不是解药。
 
 ## 目录
 

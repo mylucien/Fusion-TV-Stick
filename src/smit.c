@@ -41,6 +41,11 @@ struct st_smit_pack {
 	u8 data[1000];
 } typedef SMIT_PACK;
 
+/* 必须用 kmalloc 的缓冲区转一手，不能把调用方的 buffer 直接交给 hcd：
+ * hcd_map_urb_for_dma() 对栈上的 transfer_buffer 会 WARN_ONCE 并返回
+ * -EAGAIN（object_is_on_stack，与 VMAP_STACK 无关，只要主机控制器用 DMA
+ * 就一定命中）。真机实测：直接传栈数组时 usb_bulk_msg 返回 -11，
+ * 请求根本没发出去，看起来像"设备没应答"，把热芯片误判成冷芯片。 */
 int smit_usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data, int len, int *actual_length, int timeout)
 {
   void *buf;
@@ -48,12 +53,17 @@ int smit_usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data,
 
   buf = (void *)kmalloc(len, GFP_KERNEL);
   if ( !buf )
-    return -12;
+    return -ENOMEM;
   memcpy(buf, data, len);
   ret = usb_bulk_msg(usb_dev, pipe, buf, (unsigned int)len, actual_length, timeout);
-  if ( ret >= 0 )
+  /* IN 方向的数据是 URB 直接 DMA 进 buf 的。设备回的数据比缓冲区多时
+   * 内核只报 -EOVERFLOW，包其实已经收到了，actual_length 也有效
+   * （usb_start_wait_urb 无条件回填），这时候必须照样拷回去。
+   * 原来只在 ret >= 0 时拷，EOVERFLOW 就会把**自己发出去的请求包**
+   * 当成设备的应答交给调用方解析。 */
+  if (ret >= 0 || ret == -EOVERFLOW)
   {
-    if ( pipe & 0x80 )
+    if (usb_pipein(pipe))
       memcpy(data, buf, len);
   }
   kfree(buf);
@@ -75,7 +85,7 @@ static DEFINE_MUTEX(smit_cmd_lock);
  * 否则会一直读到错位的数据。 */
 static bool smit_resync_pending;
 
-static unsigned smit_err_streak;
+static atomic_t smit_err_streak = ATOMIC_INIT(0);
 
 /* 计数器用原子量：read_status 是每 100ms 一次的高频调用，同一 fd 上多个
  * 线程并发 ioctl 时，普通 long 的 ++ 是 read-modify-write，会丢更新，
@@ -92,61 +102,60 @@ int smit_reset(struct usb_device *udev)
 }
 
 /* 端点 stall（-EPIPE）之后必须 clear_halt，否则之后每一次传输都会立刻
- * 返回 -EPIPE，谁也救不回来 —— 这是"驱动挂死只能拔插"最典型的成因。 */
-static void smit_clear_halt(struct usb_device *udev)
-{
-	usb_clear_halt(udev, usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
-	usb_clear_halt(udev, usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE));
-}
-
-static int smit_bulk_out(struct usb_device *udev, void *data, int len)
+ * 返回 -EPIPE，谁也救不回来 —— 这是"驱动挂死只能拔插"最典型的成因。
+ *
+ * 但 clear_halt 的代价极高：它是一条 CLEAR_FEATURE 控制请求，不管端点
+ * 到底有没有真的 halt 都会发（见 ch9/message.c 的注释），超时用
+ * USB_CTRL_SET_TIMEOUT = 5s，芯片连 control 都不应答时必然走满。
+ * 所以只在"确实还会再重试一次"时才清，且只清出错的那个端点。
+ */
+static int smit_bulk_transfer(struct usb_device *udev, unsigned int pipe,
+			      void *data, int len, int *actual_len)
 {
 	int ret, actual_length = 0, tries = 0;
 
-	do {
-		ret = smit_usb_bulk_msg(udev,
-			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
-			data, len, &actual_length, SMIT_BULK_TIMEOUT_MS);
+	for (;;) {
+		ret = smit_usb_bulk_msg(udev, pipe, data, len,
+					&actual_length, SMIT_BULK_TIMEOUT_MS);
 		if (!ret)
-			return 0;
-		if (ret != -EPIPE)
 			break;
-		atomic_long_inc(&smit_stat_epipe);
-		smit_clear_halt(udev);
-	} while (++tries < 2);
-
-	if (ret == -ETIMEDOUT) {
-		atomic_long_inc(&smit_stat_timeout);
-		smit_resync_pending = true;
-	}
-	return ret;
-}
-
-static int smit_bulk_in(struct usb_device *udev, void *data, int len, int *actual_len)
-{
-	int ret, actual_length = 0, tries = 0;
-
-	do {
-		ret = smit_usb_bulk_msg(udev,
-			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
-			data, len, &actual_length, SMIT_BULK_TIMEOUT_MS);
 		/* 设备给的数据比缓冲区多只会报 EOVERFLOW，包其实已经收到了 */
-		if (!ret || ret == -EOVERFLOW) {
-			if (actual_len)
-				*actual_len = actual_length;
-			return 0;
+		if (ret == -EOVERFLOW) {
+			ret = 0;
+			break;
 		}
 		if (ret != -EPIPE)
 			break;
 		atomic_long_inc(&smit_stat_epipe);
-		smit_clear_halt(udev);
-	} while (++tries < 2);
+		/* 最后一次失败之后再清一遍 halt 没有任何意义：
+		 * 反正不会再发了，只是白等 5s（原来会在这里多烧一整个超时）。 */
+		if (++tries >= 2)
+			break;
+		usb_clear_halt(udev, pipe);
+	}
 
 	if (ret == -ETIMEDOUT) {
 		atomic_long_inc(&smit_stat_timeout);
 		smit_resync_pending = true;
 	}
+
+	if (actual_len)
+		*actual_len = actual_length;
 	return ret;
+}
+
+static int smit_bulk_out(struct usb_device *udev, void *data, int len)
+{
+	return smit_bulk_transfer(udev,
+		usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
+		data, len, NULL);
+}
+
+static int smit_bulk_in(struct usb_device *udev, void *data, int len, int *actual_len)
+{
+	return smit_bulk_transfer(udev,
+		usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
+		data, len, actual_len);
 }
 
 /* 把 IN 管道里残留的包全部读掉，让下一条命令从干净的边界开始。
@@ -195,10 +204,14 @@ static void smit_note(struct usb_device *udev, int ret)
 {
 	if (ret >= 0) {
 		atomic_long_inc(&smit_stat_ok);
-		smit_err_streak = 0;
+		atomic_set(&smit_err_streak, 0);
 		return;
 	}
-	if (!smit_is_transport_err(ret) || ret == -ENODEV || ret == -ESHUTDOWN)
+	/* -ENOMEM 是主机侧分配失败，跟链路没关系。把它算成链路故障的话，
+	 * 连续几次内存紧张就能把好芯片复位掉；module_init 里的探活更糟：
+	 * ping 返回 -ENOMEM 会被当成"冷芯片"，白复位一次再等 7s 重枚举。 */
+	if (!smit_is_transport_err(ret) || ret == -ENODEV ||
+	    ret == -ESHUTDOWN || ret == -ENOMEM)
 		return;
 
 	/* probe / smit_init 正在跑的时候不能触发自愈。
@@ -209,8 +222,8 @@ static void smit_note(struct usb_device *udev, int ret)
 	if (smit_in_probe)
 		return;
 
-	if (++smit_err_streak >= SMIT_RECOVER_STREAK) {
-		smit_err_streak = 0;
+	if (atomic_inc_return(&smit_err_streak) >= SMIT_RECOVER_STREAK) {
+		atomic_set(&smit_err_streak, 0);
 		atomic_long_inc(&smit_stat_recover);
 		smit_schedule_recovery(udev);
 	}
@@ -272,15 +285,17 @@ static int __smit_check(struct usb_device *udev, int checkcount)
   return -(1000 + checkcount);
 }
 
-static int __smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag)
+static int __smit_set(struct usb_device *udev, u8 req, u8 *data, unsigned int len, int need_complete_flag)
 {
   int ret, actual_length;
-  SMIT_PACK smit = {.tag = 0x01, .byte2 = 0x0, .req = req, .datalen = len};
+  SMIT_PACK smit = {.tag = 0x01, .byte2 = 0x0, .req = req, .datalen = (u8)len};
 
-  /* smit_set() 是从 smit.h 导出的，len 直接决定下面 memcpy 的长度。
-   * 现在所有调用点最大 37，但这个函数没有别的防线，加一道免得以后
-   * 有人传个 200 就把栈上的 SMIT_PACK 写穿。 */
-  if (len > sizeof(smit.data))
+  /* 真正有效的防线。原来写的是 len > sizeof(smit.data)，而 len 是 u8
+   * 参数：最大 255，永远不可能大于 1000，这个检查形同虚设。
+   * 有两处硬上限必须同时挡住：
+   *   - data[1000] 的物理大小
+   *   - datalen 字段是 u8，超过 255 会被静默截断成另一个长度 */
+  if (len > sizeof(smit.data) || len > 0xff)
     return -EINVAL;
 
   smit_prepare(udev);
@@ -347,11 +362,23 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
   }
 
   ret = (u8)smit.datalen;
+  /* datalen 是设备自己报的，不能盲信：SMIT_PACK 在栈上只初始化了
+   * tag/byte2/req/datalen/data[0] 几个字段，其余是垃圾。设备若报 32
+   * 而实际只回了 5 字节，按 datalen 拷贝就是把栈残留当应答交给调用方，
+   * 调用方还会读到 buf[29] 这种偏移。按实际收到的长度收紧。 */
+  if (ret > actual_length)
+    ret = actual_length;
   memcpy(out, smit.data, ret);
 
   if ( ( ret >= actual_length || smit.data[ret] != 0x80 || smit.data[ret + 3] != 0x80 ) && checkcount > 0)
   {
-      __smit_check(udev, checkcount);
+      int chk = __smit_check(udev, checkcount);
+
+      /* 原来这个返回值直接丢掉了：完成标志轮询本身在传输层挂掉时
+       * （芯片已经不回话）外面拿到的仍是"成功"，这次失败也就永远
+       * 不计入 err_streak，自愈不会启动。 */
+      if (chk < 0 && smit_is_transport_err(chk))
+        return chk;
   }
 
   return ret;
@@ -373,7 +400,7 @@ static bool smit_fault_hit(struct usb_device *udev)
 	return true;
 }
 
-int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag)
+int smit_set(struct usb_device *udev, u8 req, u8 *data, unsigned int len, int need_complete_flag)
 {
   int ret;
 
@@ -411,13 +438,20 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
  * 唯一例外是传输层失败（-110/-71/-19 这种）：芯片已经完全不回话了，
  * 剩下二十多条命令发出去也是每条白等一次超时（实测每条 560ms，二十条
  * 就是十几秒），然后 probe 才失败。这种情况下直接跳过剩余命令，
- * 让 probe 尽快返回去走复位重试。协议级错误（-1xxx）照旧继续跑。 */
+ * 让 probe 尽快返回去走复位重试。协议级错误（-1xxx）照旧继续跑。
+ *
+ * 记录错误时传输层错误优先：如果先记下的是 -1003（协议），后面链路
+ * 彻底断了，只看"第一个负值"就会把 -110 全吞掉 —— 结果是六条命令
+ * 全部白跑，返回 -1003，probe 判成"非传输错误，继续"，注册一个死设备。
+ */
 #define SMIT_DO(expr) do {						\
 	int __r = 0;							\
 	unsigned long __t0 = jiffies;					\
 	if (!(err < 0 && smit_is_transport_err(err))) {			\
 		__r = (expr);						\
-		if (__r < 0 && err == 0)				\
+		if (__r < 0 && (err >= 0 ||				\
+		    (!smit_is_transport_err(err) &&			\
+		     smit_is_transport_err(__r))))			\
 			err = __r;					\
 		if (smit_trace)						\
 			pr_info("dvb_usb_smit:  %-46s %5ums r=%d\n", #expr,	\
@@ -431,6 +465,7 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 int smit_init(struct usb_device *udev, u8 *dtmb)
 {
   int err = 0;
+  int n = 0;		/* cmd14 应答长度，0 表示没读到 */
   unsigned long t_all = jiffies;
   u8 cmd0[1]  = { 0x01 };
   u8 cmd3[10] = { 0x01, 0x92, 0x07, 0x00, 0x00, 0x01, 0x00, 0x41, 0x00, 0x01};
@@ -493,9 +528,31 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
   SMIT_DO(smit_set(udev, 0xA0, cmd14, 20, 100));
-  SMIT_DO(smit_tuner_stat(udev, buf, 0));
-  
-  *dtmb = strstr(buf + 18, "DTMB:Y") != NULL;
+
+  /* cmd14 的应答里带 tuner 的能力串（"DTMB:Y" / "DTMB:N"），位置在
+   * data+18 之后。这里有个隐蔽的前提：buf 是整个初始化序列复用的同一个
+   * 数组，如果这条 tuner_stat 被跳过（链路已死）或者自己失败了，里面
+   * 留着的是**上一条命令（cmd8）的应答**，strstr 必然匹配不到，于是
+   * 双模芯片被判成单模，而 probe 只会打一句"continuing"，毫无提示。
+   *
+   * 处理办法：先清零，再只认明确读到的内容 —— 读到 "DTMB:N" 才降级成
+   * 单模，读到 "DTMB:Y" 才升成双模，读不到就保持传入的默认值（双模
+   * ops 是单模的超集，判错时代价最小）。 */
+  memset(buf, 0, sizeof(buf));
+  SMIT_DO((n = smit_tuner_stat(udev, buf, 0)));
+
+  if (n > 18)
+  {
+    if (strstr((char *)buf + 18, "DTMB:N"))
+      *dtmb = 0;
+    else if (strstr((char *)buf + 18, "DTMB:Y"))
+      *dtmb = 1;
+  }
+  else if (smit_trace)
+  {
+    pr_info("dvb_usb_smit:  tuner info unreadable (%d), keeping %s mode\n",
+            n, *dtmb ? "dual" : "single");
+  }
 
   if (!*dtmb)
   {
@@ -535,13 +592,13 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
 static int smit_stats_get(char *buffer, const struct kernel_param *kp)
 {
 	return sysfs_emit(buffer,
-		"ok=%ld timeout=%ld epipe=%ld resync=%ld recover=%ld err_streak=%u\n",
+		"ok=%ld timeout=%ld epipe=%ld resync=%ld recover=%ld err_streak=%d\n",
 		atomic_long_read(&smit_stat_ok),
 		atomic_long_read(&smit_stat_timeout),
 		atomic_long_read(&smit_stat_epipe),
 		atomic_long_read(&smit_stat_resync),
 		atomic_long_read(&smit_stat_recover),
-		smit_err_streak);
+		atomic_read(&smit_err_streak));
 }
 
 static const struct kernel_param_ops smit_stats_ops = {

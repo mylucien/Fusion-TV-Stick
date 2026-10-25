@@ -34,7 +34,10 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/dvb-usb-smit
   SUBMENU:=Video Support
   TITLE:=SMIT iCast DTMB/DVB-C USB dongle
-  DEPENDS:=@USB_SUPPORT +kmod-usb-core
+  # @!PACKAGE_kmod-dvb-core：本包自带一个同名 dvb-core.ko，和 OpenWrt 自带的
+  # kmod-dvb-core 同时选中必然互相覆盖。用互斥让 menuconfig 里二选一；
+  # 这个符号不存在时（精简树里没这个包）Kconfig 视作 n，!n = y，不影响。
+  DEPENDS:=@USB_SUPPORT +kmod-usb-core @!PACKAGE_kmod-dvb-core
   FILES:= \
 	$(PKG_BUILD_DIR)/dvb-core.ko \
 	$(PKG_BUILD_DIR)/dvb-usb.ko \

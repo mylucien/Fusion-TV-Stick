@@ -50,6 +50,62 @@ make package/kernel/dvb-usb-smit/compile V=s
 
 只想拿 `.ko` 手动 insmod 也行，编完直接去 `build_dir/target-*/linux-*/dvb-usb-smit/` 取。
 
+## 怎么把它加进 config
+
+`KernelPackage/dvb-usb-smit` 会被自动加上 `kmod-` 前缀，所以**包名是
+`kmod-dvb-usb-smit`，配置符号是 `CONFIG_PACKAGE_kmod-dvb-usb-smit`**。
+
+内核侧**一个符号都不用加**：包里没有 `KCONFIG`，`dvb-core` / `dvb-usb` 由本包自带
+源码编出来（目标内核的 `CONFIG_MEDIA_SUPPORT` 是关的，开它反而会多出一个同名模块）。
+
+### 方式 1：直接写 `.config`（临时试）
+
+```sh
+cd <源码根>
+echo 'CONFIG_PACKAGE_kmod-dvb-usb-smit=m' >> .config
+make defconfig                 # 关键一步，不跑的话符号会被重新规范化掉
+grep dvb-usb-smit .config      # 应该看到 CONFIG_PACKAGE_kmod-dvb-usb-smit=m
+```
+
+`=m` 编成 `.ipk` 单独装；`=y` 直接塞进固件镜像。
+
+### 方式 2：让这块板子默认带上（推荐，可提交、可复现）
+
+改这个 target 的 image 定义，别手改 `.config`：
+
+```make
+# target/linux/airoha/image/<device>.mk
+define Device/your_board
+  ...
+  DEVICE_PACKAGES := kmod-dvb-usb-smit
+endef
+```
+
+之后 `make defconfig` 自己会生成 `CONFIG_PACKAGE_kmod-dvb-usb-smit=y`。
+PonWrt 如果自己有一层 device 覆盖，加在那层。
+
+### 方式 3：menuconfig
+
+```
+Kernel modules  --->  Video Support  --->  <M> kmod-dvb-usb-smit
+```
+
+### 两个坑
+
+- **符号不出现、或者写了被删掉**：本包 `DEPENDS:=@USB_SUPPORT`，target 没开 USB 时
+  这条符号在 Kconfig 里根本不存在，手写进 `.config` 也会被 `make defconfig` 静默丢掉。
+  先确认 `grep '^CONFIG_USB_SUPPORT=y' .config`（`configs/airoha-an7581-config-6.18` 里是开的）。
+- **别和 `kmod-dvb-core` 一起选**：本包自带一个同名 `dvb-core.ko`。包定义里已经有
+  `@!PACKAGE_kmod-dvb-core` 互斥（选了 OpenWrt 自带的那个，本包就灰掉）；但如果是
+  别的包用 `+kmod-dvb-core` 把它拖进来，构建照样过，装到设备上才炸 —— 后装的会覆盖
+  先装的。装之前 `opkg list-installed | grep dvb` 确认一下没有第二个 dvb-core。
+
+不想改 config、只想先确认能不能编过：
+
+```sh
+make package/kernel/dvb-usb-smit/compile V=s
+```
+
 ## 这个包做了什么
 
 `Build/Prepare`：把 `repo/` 整个拷进 `PKG_BUILD_DIR`，然后

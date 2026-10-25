@@ -184,13 +184,30 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 static void smit_disconnect(struct usb_interface *intf)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
+	int ret, i;
+
+	usb_get_dev(udev);	/* 下面的轮询期间保证 udev 不被释放 */
 
 	dvb_usb_device_exit(intf);
 
 	/* 把芯片复位回"刚插上"的状态。否则下一次 insmod 时固件还在跑，
 	 * 唤醒包和命令包全都超时，probe 必然先失败一次再靠复位自愈。
 	 * 设备已经被拔掉时这个控制请求会返回 -ENODEV，无害。 */
-	smit_reset(udev);
+	ret = smit_reset(udev);
+	dev_info(&udev->dev, "reset on disconnect: %d\n", ret);
+
+	/* 芯片复位是"发完命令才重启"，实测要 ~0.8s 才真正从总线上消失。
+	 * 如果这里立刻返回，紧跟着的 insmod 会 probe 到一个正在重启的设备，
+	 * 必然 -ETIMEDOUT 失败一次。所以等它掉线再走，上限 1.5s。 */
+	for (i = 0; i < 30; i++) {
+		if (udev->state == USB_STATE_NOTATTACHED)
+			break;
+		msleep(50);
+	}
+	if (i)
+		dev_info(&udev->dev, "device detached after %d ms\n", i * 50);
+
+	usb_put_dev(udev);
 }
 
 static struct usb_driver smit_driver = {

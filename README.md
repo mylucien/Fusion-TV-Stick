@@ -10,9 +10,12 @@
 | 交叉编译（GitHub Actions, ubuntu-24.04, gcc-13 aarch64） | ✅ |
 | `vermagic` = `6.18.55 SMP mod_unload aarch64` | ✅ 三个 .ko 全部一致 |
 | `.gnu.linkonce.this_module` = 704B（与设备内核 `struct module` 一致） | ✅ |
+| `offsetof(struct inode, i_rdev)` = 68（与设备内核 `struct inode` 一致） | ✅ |
 | 设备上 `insmod dvb-core.ko` / `dvb-usb.ko` / `dvb-usb-smit.ko` | ✅ 全部 rc=0 |
 | `usbcore: registered new interface driver dvb_usb_smit` | ✅ |
-| 插上 dongle 后 probe / 出 `/dev/dvb/adapter0` | ⏳ 待插硬件验证 |
+| 插上 dongle 后 probe / 出 `/dev/dvb/adapter0` | ✅ |
+| 打开 `frontend0` 读到 `dvb_frontend_info` | ✅ |
+| 开机 / reload 后首次 probe | ⚠️ 见下方「已知限制」 |
 
 设备上实测：
 
@@ -23,8 +26,20 @@ dvb_usb                20480  1 dvb_usb_smit
 dvb_usb_smit           20480  0
 usbcore               208896 13 dvb_usb_smit,dvb_usb,ch341,uvcvideo,...
 
-# dmesg
-usbcore: registered new interface driver dvb_usb_smit
+# ls -l /dev/dvb/adapter0/
+crw-------  root root  212, 3  frontend0
+crw-------  root root  212, 4  demux0
+crw-------  root root  212, 5  dvr0
+crw-------  root root  212, 7  net0
+```
+
+`FE_GET_INFO` 返回：
+
+```
+name       : iCast DTMB/DVBC USB demodulator
+type       : 2  OFDM（DTMB 在 Linux 里就是 FE_OFDM 类型）
+frequency  : 10000000 .. 862000000 Hz (stepsize 10000)
+caps       : 0x000b0201
 ```
 
 ## 为什么需要自己编
@@ -85,6 +100,41 @@ config MODULES_TREE_LOOKUP
 `scripts/ci-prep-config.sh` 已经这么做了，CI 里还有一道硬断言，
 段大小不等于 704 直接 fail，避免又生成一个装不上的包。
 
+## 关键坑 2：`struct inode` 大小必须一致（`i_rdev` @68）
+
+模块能加载、驱动能绑定，但一打开 `/dev/dvb/adapter0/*` 就 `ENODEV`（errno 19）。
+根因不在驱动，而在**我们编出来的 `struct inode` 和设备内核的不是同一个形状**。
+
+`dvb_device_open()` 第一件事是 `iminor(inode)` 取次设备号，实际打出来是 `1048448`：
+
+```
+dvbdiag: inode=... mode=0x2180 ino=106 rdev=0xd400003 sizeof=584 off=68   # 修好后
+```
+
+`1048448 = 0xFFF80` 正好是 aarch64 直接映射区指针高 32 位 `0xffffff80` 的低 20 位
+—— 说明读到的不是 `i_rdev`，而是 `i_mapping` 的高半。差 16 字节，来自
+`CONFIG_FS_POSIX_ACL`：
+
+```c
+#ifdef CONFIG_FS_POSIX_ACL
+	struct posix_acl	*i_acl;          /* +8 */
+	struct posix_acl	*i_default_acl;  /* +8 */
+#endif
+```
+
+设备固件是 `FS_POSIX_ACL=y`（`/proc/kallsyms` 里 `posix_acl_init`、`posix_acl_alloc`
+等是内建 `T` 符号，这就是判据；OpenWrt 的 delta 配置里写的是 `not set`，不可信）。
+`i_rdev` 因此从 52 挪到 68，我们按 52 去读就落到了 `i_mapping` 上。
+
+坑在于 **`FS_POSIX_ACL` 是 `def_bool n` 的隐藏符号，没有 prompt**，直接写
+`CONFIG_FS_POSIX_ACL=y` 会被 `olddefconfig` 丢掉。只能打开 select 它的文件系统选项：
+
+```
+CONFIG_TMPFS_POSIX_ACL=y     # select FS_POSIX_ACL
+```
+
+CI 现在会断言 `offsetof(struct inode, i_rdev) == 68`，不等就 fail。
+
 ## 目录
 
 ```
@@ -138,8 +188,25 @@ ls /dev/dvb/adapter0/
 ## 已知限制
 
 - 设备没有 `/proc/config.gz`，`.config` 是从 PonWrt 目标的 delta 反推的。
-  vermagic 和 `struct module` 尺寸这两个硬门槛已经对齐；**其它**会改变结构体布局的
-  选项（`CONFIG_PM`、`CONFIG_USB_OTG`、`CONFIG_MEDIA_CONTROLLER` 等）如果与固件真配置
-  不同，模块能 load，但访问结构体字段会错位 —— 表现为 probe 时直接 oops。
-  真出问题时，按 `dmesg` 崩在哪一行，去对相应结构体。
-- 目前没有实测 probe：测试机（192.168.0.114）上没插 `29df:0001` 的 dongle。
+  已经踩到过两个因为「delta 不等于真配置」而错位的内核结构体：
+  `struct module`（704B）和 `struct inode`（`i_rdev` @68）。两者现在都有 CI 硬断言。
+  **其它**会改变结构体布局的选项（`CONFIG_PM`、`CONFIG_USB_OTG`、`CONFIG_SECURITY` 等）
+  如果与固件真配置不同，仍可能出现 `probe` oops 或字段错位 —— 到时候按 `dmesg`
+  崩在哪一行，用同样的办法（`pahole` 看我们的偏移 / `/proc/kallsyms` 找内建符号当判据）去对。
+- **首次 probe 会失败一次**：每次 `insmod dvb-usb-smit.ko`，第一个 probe 都返回
+  `-22 (EINVAL)`，紧接着 USB 设备自己断开重枚举（device number +1），第二次 probe 才成功。
+
+  ```
+  dvb_usb_smit 1-1:1.0: probe with driver dvb_usb_smit failed with error -22
+  usb 1-1: USB disconnect, device number 3
+  usb 1-1: new high-speed USB device number 4 using xhci-mtk
+  dvb-usb: found a 'iCast DVB USB DONGLE adapter' in warm state.
+  usb 1-1: DVB: registering adapter 0 frontend 0 (...)
+  dvb-usb: iCast DVB USB DONGLE adapter successfully initialized and connected.
+  ```
+
+  开机自动加载（`/etc/modules.d/90-dvb-smit`）时同样会遇到，**约 15 秒后自动恢复**，
+  不会是永久性失败。根因在 `smit_probe` 的初始化时序（第一次的 bulk 命令在设备
+  刚枚举、接口还没 settle 时返回 EINVAL），值得后续修掉。
+- `FE_READ_BER` / `FE_READ_UNCORRECTED_BLOCKS` 返回 `ENOTSUPP`，驱动没实现；
+  `dvr0` 在未设置 demux 输出前 open 会返回 `ENOTSUP`，设好 PID 过滤后可读。

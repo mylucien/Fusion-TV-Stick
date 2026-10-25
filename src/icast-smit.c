@@ -61,6 +61,10 @@ static bool smit_diag_probe;
  * 整套 init 全 -110 并触发自愈复位，然后循环。300ms 是保守值。 */
 static int smit_settle_ms = 300;
 
+/* probe / smit_init 执行期间为 true，smit_note() 看到它就拒绝触发自愈。
+ * 详见 smit.c 里 smit_note() 的说明：这段时间的工作由 probe 自己兜底。 */
+bool smit_in_probe;
+
 module_param_named(trace, smit_trace, bool, 0644);
 MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
 module_param_named(skip_wake, smit_skip_wake, bool, 0644);
@@ -152,12 +156,6 @@ static int smit_wake(struct usb_device *udev)
 	for (;;) {
 		attempt++;
 
-		/* 清掉可能残留的 stall，同时把 data toggle 复位 */
-		usb_clear_halt(udev,
-			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
-		usb_clear_halt(udev,
-			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE));
-
 		memcpy(buf, wake, sizeof(wake));
 		ret = usb_bulk_msg(udev,
 			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
@@ -185,6 +183,20 @@ static int smit_wake(struct usb_device *udev)
 		 * 其它错误（设备没了/被关掉了）重试没有意义 */
 		if (ret != -EPIPE && ret != -ETIMEDOUT)
 			break;
+
+		/* 只有真 stall(-EPIPE) 才值得付 clear_halt 的代价。
+		 * 原来这里是每轮无条件清两次，而 usb_clear_halt 内部发的是
+		 * CLEAR_FEATURE 控制请求、超时用 USB_CTRL_GET_TIMEOUT（5s）：
+		 * 芯片连 control 都不应答时每轮固定烧 10s，1s 的预算形同废纸
+		 * （实测死透的芯片能把这里拖到几十秒）。超时的时候端点并没有
+		 * halt，清它纯属自找 5s。 */
+		if (ret == -EPIPE) {
+			usb_clear_halt(udev,
+				usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
+			usb_clear_halt(udev,
+				usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE));
+		}
+
 		if (time_after_eq(jiffies, deadline))
 			break;
 
@@ -372,6 +384,10 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_device *udev = interface_to_usbdev(intf);
 	int ret;
 
+	/* 从这里到 out: 之间所有命令的传输层失败都不许触发自愈复位，
+	 * 否则会和下面 probe 自己的复位逻辑打架 —— 详见 smit_note()。 */
+	smit_in_probe = true;
+
 	if (smit_diag_probe)
 		smit_diag(udev);
 
@@ -398,14 +414,14 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 			dev_info(&udev->dev,
 				 "device is going away (%d), leaving it to re-enumerate\n",
 				 ret);
-			return ret;
+			goto out;
 		}
 		dev_info(&udev->dev,
 			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
 		if (smit_reset_allowed())
 			smit_reset(udev);
-		return ret;
+		goto out;
 	}
 
 	/* 唤醒包只是让芯片从 bootloader 跳到应用固件，它回的 ACK 只代表
@@ -420,11 +436,17 @@ do_init:
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {
 		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
+		/* 设备正在消失时不要补一刀复位，理由同上：复位只会把重枚举
+		 * 再拖一遍。wake 分支已经这么处理了，init 这里漏了。 */
+		if (ret == -ENODEV || ret == -ESHUTDOWN) {
+			dev_info(&udev->dev, "device is going away (%d)\n", ret);
+			goto out;
+		}
 		/* 实验模式下不要复位：否则同一次 insmod 里会不断
 		 * 复位→重枚举→再失败，变成死循环 */
 		if (!smit_skip_wake && smit_reset_allowed())
 			smit_reset(udev);
-		return ret;
+		goto out;
 	}
 	if (ret)
 		/* 协议级错误（设备回了怪数据）上游一直是忽略的，
@@ -437,18 +459,27 @@ register_device:
 	if (ret == 0) {
 		/* 一次成功的 probe 说明链路是好的，把自愈计数清零 */
 		smit_reset_attempts = 0;
-		return 0;
+		goto out;
 	}
 
 	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
 	if (smit_reset_allowed())
 		smit_reset(udev);
+out:
+	smit_in_probe = false;
 	return ret;
 }
 
 static void smit_disconnect(struct usb_interface *intf)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
+
+	/* 设备走了，"这是个热芯片"的凭据就作废。
+	 * devnum 是 USB 核心回收复用的：留着它的话，下一次插上来的冷芯片
+	 * 完全可能拿到同一个号，probe 就会误判成热芯片、跳过唤醒和初始化，
+	 * 节点出来了但前端全哑（每条命令都超时），再靠自愈绕一圈才恢复。
+	 * 自愈路径上本来自己会清，但外部拔插不会，所以必须在这里清。 */
+	smit_warm_devnum = -1;
 
 	dvb_usb_device_exit(intf);
 
@@ -481,7 +512,11 @@ static int __init smit_module_init(void)
 	 *   - 冷芯片：探针弄脏了 FIFO，就地复位（此时没有 driver，不会引发 probe） */
 	usb_for_each_dev(&udev, smit_pick_device);
 	if (udev) {
+		/* 探针失败在这里是**预期**结果（冷芯片本来就该超时），
+		 * 不能让它记进链路失败计数，更不能顺势触发自愈复位。 */
+		smit_in_probe = true;
 		ret = smit_ping(udev);
+		smit_in_probe = false;
 		if (!smit_is_transport_err(ret)) {
 			smit_warm_devnum = udev->devnum;
 			pr_info("dvb_usb_smit: chip already initialized (devnum %d), will reuse it\n",
@@ -491,7 +526,10 @@ static int __init smit_module_init(void)
 
 			pr_info("dvb_usb_smit: cold chip (ping %d), resetting it for a clean probe\n",
 				ret);
-			smit_reset(udev);	/* 加载时第一次清 FIFO，计入尝试次数 */
+			/* 这一步只是清掉探针弄脏的 FIFO，不是"救卡死"，
+			 * 所以不经过 smit_reset_allowed()，不占用死循环保护
+			 * 那 3 次预算（probe 成功会把它清零，但没必要先花一次）。 */
+			smit_reset(udev);
 
 			/* 复位是"发完命令才重启"，实测要 ~0.8s 才真正从总线上消失。
 			 * 如果这时就去 usb_register，probe 会撞上一个正在重启的设备

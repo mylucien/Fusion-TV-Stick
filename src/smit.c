@@ -10,6 +10,7 @@
 #include <linux/jiffies.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
+#include <linux/atomic.h>
 #include <linux/moduleparam.h>
 #include <linux/version.h>
 
@@ -29,12 +30,15 @@
 /* 连续多少次"整条事务"在传输层失败就认为芯片卡死，触发自愈复位 */
 #define SMIT_RECOVER_STREAK	3
 
+/* 用 u8 而不是 char：aarch64 上 char 默认无符号，比较刚好能碰对，
+ * 但 x86 上 char 有符号，data[i] == 0x80 会变成 -128 == 128，永远为假，
+ * "完成标志"判断直接失效。目标平台虽然只有 aarch64，也没理由留这种地雷。 */
 struct st_smit_pack {
-	char tag;
-	char byte2;
-	char req;
-	char datalen;
-	char data[1000];
+	u8 tag;
+	u8 byte2;
+	u8 req;
+	u8 datalen;
+	u8 data[1000];
 } typedef SMIT_PACK;
 
 int smit_usb_bulk_msg(struct usb_device *usb_dev, unsigned int pipe, void *data, int len, int *actual_length, int timeout)
@@ -72,8 +76,15 @@ static DEFINE_MUTEX(smit_cmd_lock);
 static bool smit_resync_pending;
 
 static unsigned smit_err_streak;
-static unsigned long smit_stat_ok, smit_stat_timeout, smit_stat_epipe,
-		     smit_stat_resync, smit_stat_recover;
+
+/* 计数器用原子量：read_status 是每 100ms 一次的高频调用，同一 fd 上多个
+ * 线程并发 ioctl 时，普通 long 的 ++ 是 read-modify-write，会丢更新，
+ * 让 stats 数字比实际偏小 —— 而这几个数字正是排查"挂在哪一层"的唯一依据。 */
+static atomic_long_t smit_stat_ok = ATOMIC_LONG_INIT(0);
+static atomic_long_t smit_stat_timeout = ATOMIC_LONG_INIT(0);
+static atomic_long_t smit_stat_epipe = ATOMIC_LONG_INIT(0);
+static atomic_long_t smit_stat_resync = ATOMIC_LONG_INIT(0);
+static atomic_long_t smit_stat_recover = ATOMIC_LONG_INIT(0);
 
 int smit_reset(struct usb_device *udev)
 {
@@ -100,12 +111,12 @@ static int smit_bulk_out(struct usb_device *udev, void *data, int len)
 			return 0;
 		if (ret != -EPIPE)
 			break;
-		smit_stat_epipe++;
+		atomic_long_inc(&smit_stat_epipe);
 		smit_clear_halt(udev);
 	} while (++tries < 2);
 
 	if (ret == -ETIMEDOUT) {
-		smit_stat_timeout++;
+		atomic_long_inc(&smit_stat_timeout);
 		smit_resync_pending = true;
 	}
 	return ret;
@@ -127,12 +138,12 @@ static int smit_bulk_in(struct usb_device *udev, void *data, int len, int *actua
 		}
 		if (ret != -EPIPE)
 			break;
-		smit_stat_epipe++;
+		atomic_long_inc(&smit_stat_epipe);
 		smit_clear_halt(udev);
 	} while (++tries < 2);
 
 	if (ret == -ETIMEDOUT) {
-		smit_stat_timeout++;
+		atomic_long_inc(&smit_stat_timeout);
 		smit_resync_pending = true;
 	}
 	return ret;
@@ -168,7 +179,7 @@ static void smit_drain_in(struct usb_device *udev)
 			break;		/* 超时 / stall：认为已经空了 */
 	}
 	kfree(buf);
-	smit_stat_resync++;
+	atomic_long_inc(&smit_stat_resync);
 }
 
 static void smit_prepare(struct usb_device *udev)
@@ -183,16 +194,24 @@ static void smit_prepare(struct usb_device *udev)
 static void smit_note(struct usb_device *udev, int ret)
 {
 	if (ret >= 0) {
-		smit_stat_ok++;
+		atomic_long_inc(&smit_stat_ok);
 		smit_err_streak = 0;
 		return;
 	}
 	if (!smit_is_transport_err(ret) || ret == -ENODEV || ret == -ESHUTDOWN)
 		return;
 
+	/* probe / smit_init 正在跑的时候不能触发自愈。
+	 * 冷启动的 init 有二十多条命令，芯片启动慢一点就会连续几条超时，
+	 * 这时如果让 workqueue 插进来复位，等于把还没注册完的设备拆掉：
+	 * probe 后续命令全 -ENODEV -> probe 失败 -> 又复位一次 -> 循环。
+	 * init 期间的失败由 probe 自己统一判断，不归这里管。 */
+	if (smit_in_probe)
+		return;
+
 	if (++smit_err_streak >= SMIT_RECOVER_STREAK) {
 		smit_err_streak = 0;
-		smit_stat_recover++;
+		atomic_long_inc(&smit_stat_recover);
 		smit_schedule_recovery(udev);
 	}
 }
@@ -257,6 +276,12 @@ static int __smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int nee
 {
   int ret, actual_length;
   SMIT_PACK smit = {.tag = 0x01, .byte2 = 0x0, .req = req, .datalen = len};
+
+  /* smit_set() 是从 smit.h 导出的，len 直接决定下面 memcpy 的长度。
+   * 现在所有调用点最大 37，但这个函数没有别的防线，加一道免得以后
+   * 有人传个 200 就把栈上的 SMIT_PACK 写穿。 */
+  if (len > sizeof(smit.data))
+    return -EINVAL;
 
   smit_prepare(udev);
 
@@ -426,7 +451,12 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   	0x00,	0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
   }; 
   u8 cmd14[20] = { 0x01, 0x90, 0x02, 0x00, 0x03, 0x9F, 0x9A, 0x07, 0x0B, 0x07, 0x00, 0x08, 0x10, 0x07, 0x00, 0x04, 0x47, 0x44, 0x48, 0x57};
-  u8 buf[1000];
+  /* 必须清零。下面靠 strstr(buf + 18, "DTMB:Y") 判断双模/单模，而 strstr
+   * 要求 NUL 结尾：设备正常最多回 255 字节（datalen 是 u8），但一旦
+   * smit_tuner_stat 全部失败，这块栈数组就是未初始化的垃圾，strstr 会
+   * 一路读到 1000 字节之外 —— 内核栈越界读，轻则把随机内存当成字符串，
+   * 重则踩到 guard page 直接 oops。清零之后最坏也只是退化成单模。 */
+  u8 buf[1000] = { 0, };
 
   SMIT_DO(smit_set(udev, 0x82, cmd0, 1, 100));
   SMIT_DO(smit_tuner_stat(udev, buf, 0));
@@ -505,9 +535,13 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
 static int smit_stats_get(char *buffer, const struct kernel_param *kp)
 {
 	return sysfs_emit(buffer,
-		"ok=%lu timeout=%lu epipe=%lu resync=%lu recover=%lu err_streak=%u\n",
-		smit_stat_ok, smit_stat_timeout, smit_stat_epipe,
-		smit_stat_resync, smit_stat_recover, smit_err_streak);
+		"ok=%ld timeout=%ld epipe=%ld resync=%ld recover=%ld err_streak=%u\n",
+		atomic_long_read(&smit_stat_ok),
+		atomic_long_read(&smit_stat_timeout),
+		atomic_long_read(&smit_stat_epipe),
+		atomic_long_read(&smit_stat_resync),
+		atomic_long_read(&smit_stat_recover),
+		smit_err_streak);
 }
 
 static const struct kernel_param_ops smit_stats_ops = {

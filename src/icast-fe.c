@@ -60,11 +60,14 @@ static int icast_fe_get_frontend(struct dvb_frontend *fe, struct dtv_frontend_pr
   return 0;
 }
 
-#define DWORD_TO_BYTES(dword, bytes, position) \
-  bytes[position] = (u8)(dword & 0xFF); \
-  bytes[position+1] = (u8)((dword>>8) & 0xFF); \
-  bytes[position+2] = (u8)((dword>>16) & 0xFF); \
-  bytes[position+3] = (u8)((dword>>24) & 0xFF);
+/* do-while(0) 包起来，否则这四条语句在 if/else 里展开就只剩第一条受控，
+ * 是个典型的静默错误。参数也统一加括号，避免传表达式时被优先级坑。 */
+#define DWORD_TO_BYTES(dword, bytes, position) do {			\
+  (bytes)[position]     = (u8)((dword) & 0xFF);				\
+  (bytes)[position + 1] = (u8)(((dword) >> 8) & 0xFF);			\
+  (bytes)[position + 2] = (u8)(((dword) >> 16) & 0xFF);			\
+  (bytes)[position + 3] = (u8)(((dword) >> 24) & 0xFF);			\
+} while (0)
 
 static int icast_fe_set_frontend(struct dvb_frontend *fe)
 {
@@ -154,6 +157,10 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
   if ( smit_tuner_stat(priv->dev->udev, buf, 5) != 32 )
   {
+    /* 读失败时锁状态是未知的，按"没锁"上报。
+     * 不这么做的话 priv->lock 会停在上一次的值，read_signal_strength /
+     * read_snr 会继续返回旧的强度和信噪比，看起来像是信号还在。 */
+    priv->lock = 0;
     return 0;
   }
   priv->lock = (u8)buf[29];
@@ -166,7 +173,13 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   {
     *status = FE_HAS_SIGNAL | FE_HAS_LOCK;
 
-		priv->frequency = (buf[19]<<24) + (buf[18]<<16) + (buf[17]<<8) + buf[16];
+    /* 必须先把每个字节提升到 u32 再移位。
+     * buf[] 是 u8，单独取出来会提升成有符号 int，buf[19] << 24 在
+     * buf[19] >= 0x80 时就是"移进符号位"——未定义行为（UBSAN 直接报
+     * shift-out-of-bounds）。实际行为是得到负数再靠加法回绕，位模式
+     * 碰巧对，但编译器一旦优化就没有保证了。 */
+		priv->frequency = ((u32)buf[19] << 24) | ((u32)buf[18] << 16) |
+		                  ((u32)buf[17] << 8) | (u32)buf[16];
     priv->snr = (u8)buf[30];
     priv->strength = (u8)buf[31];
 //    printk("buf[30]=%02X buf[31]=%02X", buf[30], buf[31]);

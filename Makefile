@@ -2,7 +2,7 @@
 #
 # dvb-usb-smit -- SMIT iCast DTMB/DVBC USB dongle driver
 #
-# Port target: airoha/an7581 (ARMv8 Cortex-A53), kernel 6.18.52
+# Port target: airoha/an7581 (ARMv8 Cortex-A53), kernel 6.18.55
 #
 # The DVB stack is compiled out-of-tree from the exact kernel version, so the
 # target kernel does NOT need CONFIG_MEDIA_SUPPORT / CONFIG_DVB_CORE enabled.

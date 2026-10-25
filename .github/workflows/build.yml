@@ -74,6 +74,7 @@ jobs:
 
       - name: 编译模块
         run: |
+          set -o pipefail   # 否则 tee 会吞掉 make 的失败码
           make KERNEL_DIR=$HOME/kernel/linux-${KVER} \
             ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
             NO_RC=1 KBUILD_MODPOST_WARN=1 -j$(nproc) 2>&1 | tee build.log

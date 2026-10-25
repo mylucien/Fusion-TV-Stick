@@ -27,6 +27,11 @@ cp -a "$KERNEL_DIR/drivers/media/dvb-core" kern/
 echo ">> copying dvb-usb"
 cp -a "$KERNEL_DIR/drivers/media/usb/dvb-usb" kern/
 
+# dvb-usb.h 里 #include "dvb-pll.h"，而 6.18 已把 dvb-pll.h 挪到 dvb-frontends，
+# 树外编译时同目录找不到，补一份进来（只是原型声明，不需要 dvb-pll.c）。
+echo ">> copying dvb-pll.h from dvb-frontends"
+cp -a "$KERNEL_DIR/drivers/media/dvb-frontends/dvb-pll.h" kern/dvb-usb/
+
 if [ "$NO_RC" = "0" ]; then
 	echo ">> copying rc (NO_RC=0)"
 	cp -a "$KERNEL_DIR/drivers/media/rc" kern/
@@ -47,7 +52,7 @@ for f in dvbdev.c dmxdev.c dvb_demux.c dvb_ca_en50221.c dvb_frontend.c \
 	check "dvb-core/$f"
 done
 for f in dvb-usb-init.c dvb-usb-urb.c dvb-usb-i2c.c dvb-usb-dvb.c \
-         dvb-usb-firmware.c usb-urb.c dvb-usb.h dvb-usb-common.h; do
+         dvb-usb-firmware.c usb-urb.c dvb-usb.h dvb-usb-common.h dvb-pll.h; do
 	check "dvb-usb/$f"
 done
 if [ "$NO_RC" = "0" ]; then

@@ -20,6 +20,9 @@ static inline int smit_is_transport_err(int ret)
 	return ret < 0 && ret > -1000;
 }
 
+/* 调试开关，定义在 icast-smit.c，供本文件打点用 */
+extern bool smit_trace;
+
 int smit_reset(struct usb_device *udev);
 int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag);
 int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount);

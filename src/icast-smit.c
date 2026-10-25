@@ -30,6 +30,25 @@
 
 DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
+/* ---- 调试开关（默认全关，不影响正常行为） ----------------------------
+ *
+ * trace      : 打印 smit_init 每条命令的耗时
+ * skip_wake  : probe 时跳过唤醒包，直接跑初始化序列
+ *              （用来判定"热芯片到底还不还听得懂命令"）
+ * keep_warm  : 卸载时不做硬件复位，把芯片留在"已初始化"的热状态
+ *              （配合 skip_wake 做对照实验）
+ */
+bool smit_trace;
+static bool smit_skip_wake;
+static bool smit_keep_warm;
+
+module_param_named(trace, smit_trace, bool, 0644);
+MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
+module_param_named(skip_wake, smit_skip_wake, bool, 0644);
+MODULE_PARM_DESC(skip_wake, "skip the wake-up packet and go straight to init");
+module_param_named(keep_warm, smit_keep_warm, bool, 0644);
+MODULE_PARM_DESC(keep_warm, "do not hardware-reset the chip on disconnect");
+
 static struct icast_fe_config icast_config = {
 	.dtmb = 0,
 };
@@ -173,6 +192,18 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	struct usb_device *udev = interface_to_usbdev(intf);
 	int ret;
 
+	if (smit_skip_wake) {
+		/* 实验路径：先打一发纯命令探测，看热芯片的命令通道还通不通。
+		 * 0x81 就是前端 read_status 用的那条命令，芯片若在应用模式应当应答。 */
+		u8 pbuf[900];
+
+		ret = smit_tuner_stat(udev, pbuf, 0);
+		dev_info(&udev->dev,
+			 "skip_wake: raw tuner_stat probe -> %d (buf[0]=%02x buf[1]=%02x)\n",
+			 ret, pbuf[0], pbuf[1]);
+		goto do_init;
+	}
+
 	ret = smit_wake(udev);
 	if (ret) {
 		/* 固件已经初始化过 / 端点坏了：芯片不会应答任何命令，
@@ -184,6 +215,7 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 		smit_reset(udev);
 		return ret;
 	}
+do_init:
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {
 		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
@@ -221,6 +253,12 @@ static void smit_disconnect(struct usb_interface *intf)
 	usb_get_dev(udev);	/* 下面的轮询期间保证 udev 不被释放 */
 
 	dvb_usb_device_exit(intf);
+
+	if (smit_keep_warm) {
+		dev_info(&udev->dev, "keep_warm: leaving chip initialized\n");
+		usb_put_dev(udev);
+		return;
+	}
 
 	/* 把芯片复位回"刚插上"的状态。否则下一次 insmod 时固件还在跑，
 	 * 唤醒包和命令包全都超时，probe 必然先失败一次再靠复位自愈。

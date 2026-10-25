@@ -7,6 +7,7 @@
 
 #include "dvb-usb.h"
 #include "smit.h"
+#include <linux/jiffies.h>
 
 struct st_smit_pack {
 	char tag;
@@ -161,11 +162,21 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
  * （-1003/-1004/-1006）也能继续跑。为了让 probe 能区分"设备回了怪数据"
  * 和"USB 传输本身挂了"，这里把第一个负返回值记下来带出去，
  * 但流程照旧全部执行，不提前退出。 */
-#define SMIT_DO(expr) do { int __r = (expr); if (__r < 0 && err == 0) err = __r; } while (0)
+#define SMIT_DO(expr) do {						\
+	int __r;							\
+	unsigned long __t0 = jiffies;					\
+	__r = (expr);							\
+	if (__r < 0 && err == 0)					\
+		err = __r;						\
+	if (smit_trace)							\
+		pr_info("dvb_usb_smit:  %-46s %5ums r=%d\n", #expr,	\
+			jiffies_to_msecs(jiffies - __t0), __r);		\
+} while (0)
 
 int smit_init(struct usb_device *udev, u8 *dtmb)
 {
   int err = 0;
+  unsigned long t_all = jiffies;
   u8 cmd0[1]  = { 0x01 };
   u8 cmd3[10] = { 0x01, 0x92, 0x07, 0x00, 0x00, 0x01, 0x00, 0x41, 0x00, 0x01};
   u8 cmd4[9]  = { 0x01, 0x90, 0x02, 0x00, 0x01, 0x9F, 0x80, 0x10, 0x00 };
@@ -241,6 +252,10 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   SMIT_DO(smit_set(udev, 0xA0, cmd9, 32, 100));
   SMIT_DO(smit_tuner_stat(udev, buf, 20));
   
+  if (smit_trace)
+    pr_info("dvb_usb_smit:  init sequence took %ums\n",
+            jiffies_to_msecs(jiffies - t_all));
+
   return err;
 }
 

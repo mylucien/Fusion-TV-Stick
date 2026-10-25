@@ -97,7 +97,20 @@ jobs:
           echo "===== .gnu.linkonce.this_module 段大小（设备要求 704）====="
           if [ -f dvb-core.ko ]; then
             aarch64-linux-gnu-objdump -h dvb-core.ko | grep -E "this_module" || true
+            aarch64-linux-gnu-objdump -r -j .gnu.linkonce.this_module dvb-core.ko || true
+          else
+            echo "no dvb-core.ko"
           fi
+
+      - name: 诊断：struct module 字段偏移（pahole）
+        if: always()
+        run: |
+          if [ ! -f dvb-core.ko ]; then echo "no ko"; exit 0; fi
+          sudo apt-get install -y -qq dwarves >/dev/null 2>&1 || true
+          for t in module mod_kallsyms module_memory mod_arch_specific module_kobject; do
+            echo "===== struct $t ====="
+            pahole -C "$t" dvb-core.ko 2>&1 | head -80 || true
+          done
 
       - name: 校验产物
         run: |

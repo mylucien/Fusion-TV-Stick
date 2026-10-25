@@ -83,15 +83,17 @@ static struct dvb_usb_device_properties icast_properties = {
 
 /* 唤醒序列 "FE 00 10 00" 只对"刚枚举出来、固件还没被初始化过"的设备有效。
  *
- * 如果设备已经被上一轮驱动实例初始化过（rmmod 再 insmod、或者 modprobe 两次），
- * 芯片已经在跑固件了，这个包的 IN 应答会超时（-ETIMEDOUT），probe 于是失败，
- * 只能靠 smit_reset() 把芯片复位、设备重新枚举（约 6~7s）之后第二次 probe 才成功。
+ * 实测：设备被上一轮驱动实例初始化过之后（rmmod 再 insmod），不只是唤醒包，
+ * 连后续所有命令包的 IN 应答都超时（-ETIMEDOUT）——芯片根本不回话，
+ * 只有 smit_reset() 的硬件复位能把它救回来，代价是设备重新枚举 6~7 秒。
  * 这就是"每次 insmod 第一个 probe 必失败"的来源。
  *
- * 处理办法：
- *   - 端点被 stall（-EPIPE）才值得 clear_halt 重试；
- *   - 超时说明是"热设备"，不再浪费重试时间，交给调用方按热状态继续初始化；
- *   - 其它错误（-ENODEV/-ESHUTDOWN 等）才真正失败。 */
+ * 所以：
+ *   - 卸载时（smit_disconnect）就复位，把设备留成"刚插上"的状态，
+ *     这样下一次 insmod 的第一次 probe 就是干净的；
+ *   - probe 里一旦唤醒无应答立刻复位返回，不再白跑一遍 smit_init（约 12s）；
+ *   - 端点被 stall（-EPIPE）才 clear_halt 重试。
+ */
 #define SMIT_WAKE_ATTEMPTS	3
 #define SMIT_WAKE_BUF_SIZE	512
 
@@ -147,19 +149,22 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	int ret;
 
 	ret = smit_wake(udev);
-	if (ret)
-		/* 热设备：芯片已经在跑固件，唤醒包本来就没人应答。
-		 * 下面重发一遍同样的寄存器配置没有副作用，还省掉一次
-		 * 6~7s 的复位重新枚举。真要是设备没了，smit_init 会以
-		 * 传输层错误失败，再走复位兜底。 */
+	if (ret) {
+		/* 固件已经初始化过 / 端点坏了：芯片不会应答任何命令，
+		 * 只能硬件复位让它重新枚举，以干净状态再来一次。
+		 * 这里不要再去试 smit_init —— 那是 20 多条命令 × 500ms 超时。 */
 		dev_info(&udev->dev,
-			 "wake not answered (%d), assuming device already initialized\n",
+			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
+		smit_reset(udev);
+		return ret;
+	}
 
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {
 		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
-		goto reset_device;
+		smit_reset(udev);
+		return ret;
 	}
 	if (ret)
 		/* 协议级错误（设备回了怪数据）上游一直是忽略的，
@@ -172,18 +177,26 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 		return 0;
 
 	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
-
-reset_device:
-	/* 兜底：让设备复位并重新枚举，下一次 probe 从干净状态开始。
-	 * 注意复位之后 udev 很快失效，这里只能立刻返回。 */
 	smit_reset(udev);
-	return ret ? ret : -EINVAL;
+	return ret;
+}
+
+static void smit_disconnect(struct usb_interface *intf)
+{
+	struct usb_device *udev = interface_to_usbdev(intf);
+
+	dvb_usb_device_exit(intf);
+
+	/* 把芯片复位回"刚插上"的状态。否则下一次 insmod 时固件还在跑，
+	 * 唤醒包和命令包全都超时，probe 必然先失败一次再靠复位自愈。
+	 * 设备已经被拔掉时这个控制请求会返回 -ENODEV，无害。 */
+	smit_reset(udev);
 }
 
 static struct usb_driver smit_driver = {
 	.name = KBUILD_MODNAME,
 	.probe = smit_probe,
-	.disconnect = dvb_usb_device_exit,
+	.disconnect = smit_disconnect,
 	.id_table = icast_id_table,
 };
 

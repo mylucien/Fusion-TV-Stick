@@ -15,7 +15,10 @@
 | `usbcore: registered new interface driver dvb_usb_smit` | ✅ |
 | 插上 dongle 后 probe / 出 `/dev/dvb/adapter0` | ✅ |
 | 打开 `frontend0` 读到 `dvb_frontend_info` | ✅ |
-| 首次 probe（开机 / rmmod+insmod） | ✅ 唤醒包 1 次命中、0 ms，无失败重试 |
+| 热 reload（`rmmod` + `insmod`）出节点 | ✅ **0.11s**（热芯片直接复用，不复位不重枚举） |
+| 冷启动（插拔 / 复位后） | ✅ 10s（7s USB 枚举 + 2.7s init），一次成功 |
+| 整机重启后开机 | ✅ 一次 probe 成功，`probe_failed=0` |
+| 真机重启验证 | ✅ 重启后 `demux0 dvr0 frontend0 net0` 齐全 |
 
 设备上实测：
 
@@ -135,41 +138,70 @@ CONFIG_TMPFS_POSIX_ACL=y     # select FS_POSIX_ACL
 
 CI 现在会断言 `offsetof(struct inode, i_rdev) == 68`，不等就 fail。
 
-## 关键坑 3：首次 probe 必失败（`-22` / `-110`）
+## 关键坑 3：热芯片怎么处理（`-22` / `-110` / reload 慢）
 
-症状：每轮 `insmod dvb-usb-smit` 的第一个 probe 必然失败，随后 dongle 自己断开
-重新枚举（`devnum` +1），第二次才成功，肉眼看到的是"插了要等十几秒才出节点"。
-开机也一样。
+最初的症状：每轮 `insmod dvb-usb-smit` 的第一个 probe 必然失败，随后 dongle 自己断开
+重新枚举（`devnum` +1），第二次才成功，肉眼看到的是"插了要等十几秒才出节点"。开机也一样。
 
-根因不在 usbcore，而在芯片状态：`smit_probe()` 第一步要发唤醒序列
-`FE 00 10 00`，这条协议**只对"刚上电/刚复位"的芯片有效**。芯片一旦被任何一轮
-驱动实例初始化过，固件就不再应答 —— 不只是唤醒包，连后续命令包的 IN 全是
-`-110 (ETIMEDOUT)`，只有 `smit_reset()`（vendor 控制请求 `bRequest=0xA0, wValue=0x40`）
-的硬件复位能救回来，代价是 USB 重新枚举 6~7 秒。
+第一版的判断是"热芯片不应答任何命令，只有硬件复位能救"，于是加了
+disconnect 复位 + reboot notifier，把 reload 时间定格在 14s。**这个判断是错的。**
 
-实测数据（设备上 `cat /dev/kmsg` 取的）：
+真机对照实验（`keep_warm=1` 卸载不复位，然后 `skip_wake=1` 直接跑初始化序列）
+推翻了它：
 
-| 芯片状态 | 唤醒包结果 |
+| 热芯片上的操作 | 结果 |
 |---|---|
-| 冷（刚复位/重新枚举后） | `wake answered after 1 attempt(s), 0 ms` |
-| 热（被初始化过）        | `wake gave up after 9 attempt(s) / 6270 ms, last error -110` |
+| 发唤醒包 `FE 00 10 00` | 无应答，**且之后所有命令全 `-110`** |
+| 只发一条命令（不唤醒不 init） | 立即正常应答：`raw tuner_stat probe -> 34`、`cmd0 0ms r=0`、`cmd3 0ms r=0` |
+| 完整重跑 `smit_init()` | `cmd0`/`cmd3` 都应答，**`cmd4`（写寄存器 `0x9F/0x80/0x10`）之后固件彻底不回话** |
 
-所以不能靠"多等一会儿"解决，只能保证**每次 probe 面对的芯片都是冷的**。
-三处配合：
+所以芯片初始化过一次之后命令通道一直是活的，把它打死的恰恰是我们自己的
+"重新初始化"和"唤醒包"。正确做法是**热芯片直接复用，根本不要碰它**。
 
-1. `smit_disconnect()`：`dvb_usb_device_exit()` 之后 `smit_reset()`，把芯片复位回冷状态。
-   复位是"命令发完才重启"，实测约 0.8s 后设备才从总线消失，所以这里轮询
-   `udev->state == USB_STATE_NOTATTACHED`（上限 1.5s）再返回，避免紧跟的 `insmod`
-   probe 到一个正在重启的设备。
-2. `smit_reboot_notify()`：注册 `reboot_notifier`，重启/关机前同样复位。
-   **路由器重启并不切断 dongle 的供电**，芯片会带着"已初始化"状态活到下一次开机，
-   没有这一步的话开机第一次 probe 必失败。
-3. `smit_wake()`：在 1s 预算内重试，`-EPIPE`/`-ETIMEDOUT` 才重试，
-   其它错误立刻放弃；全部失败就 `smit_reset()` 返回，**不要**再去跑一遍
-   `smit_init()`（那是 20 多条命令 × 500ms 超时）。
+判定"冷还是热"试过三条路，前两条都失败，记下来免得再踩：
 
-改完实测：开机只有一次枚举（`devnum=2`，没有断开重来），`insmod` 紧接
-`rmmod` 也一次成功，`probe_failed=0 / self_reset=0 / warnings=0`。
+1. **设备描述符 / 字符串 / vendor control 请求** —— 冷热完全一致
+   （`bcdDevice=0200`、`iProduct="DONGLE"`、几个 `0xC0` 请求一律 `-11`），零区分度。
+2. **在 `probe` 里用 bulk 命令探活** —— 冷芯片收不到应答时，探针的 5 个字节
+   已经留在它的 OUT FIFO 里，紧跟着的唤醒包被拼成畸形命令，握手必失败
+   （加大到 4s / 10 次重发也冲不掉）。probe 失败又触发复位 → 重枚举 → 再探测 →
+   再污染，**实测无限循环**。
+   另外探针别手搓 `usb_bulk_msg` + 栈缓冲区，那种写法实测返回 `-11 (EAGAIN)`，
+   看起来像错误但根本不是设备给的答案，会把热芯片误判成冷芯片。走 `smit_set()`
+   （内部 `kmalloc` 缓冲区）才可靠。
+3. **在 `module_init` 里探活（当前方案）** —— 此时还没 `usb_register`，
+   复位不会引发任何 probe，污染可以就地清掉，也就不可能循环。
+
+最终架构：
+
+```
+module_init（usb_register 之前）
+  总线查找 29df:0001
+    ├─ ping 有应答 -> 记下 devnum，等 probe 复用
+    └─ ping 超时   -> 是冷芯片但 FIFO 被探针弄脏
+                      smit_reset() 清干净，并轮询 udev->state 直到 NOTATTACHED
+                      （约 0.8s）再 usb_register，避免 probe 撞上正在重启的设备
+probe
+    devnum == 记录值 -> 直接 dvb_usb_device_init()，不唤醒不 init（~0s）
+    否则             -> 唤醒 + smit_init + 注册
+```
+
+`devnum` 每次重新枚举都会变，顺便充当"还是不是当年那个芯片"的凭据，拔插后不会误复用。
+
+实测（真机，`/dev/kmsg` 取的）：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| `rmmod` + `insmod`（热芯片） | 14s | **0.11s**，连测 3 次稳定 |
+| 冷启动（dongle 复位/重插） | 10s | 10s（7s USB 枚举 + 2.7s init），一次成功 |
+| 整机重启后开机 | 第一次 probe 失败、7s 自愈 | 一次 probe 成功，`probe_failed=0` |
+| `smit_init()` 序列本身 | 7610ms | **2730ms** |
+
+`init` 那 5s 的优化来自两处：`smit_set()` 里无条件的 `msleep(100)`（全序列 10 处 = 1s）
+改为直接进 `smit_check()` 的退避轮询；序列末尾那条 `cmd9` 是调谐命令，初始化阶段
+频点全 0，芯片既不调谐也不回完成标志，实测白等 **4390ms** 拿 `-1100`，改成只发不收完成标志。
+
+因为 probe 现在能正确处理热芯片，`reboot_notifier` 已经删掉 —— 重启前不需要做任何事。
 
 ## 目录
 
@@ -229,9 +261,19 @@ ls /dev/dvb/adapter0/
   **其它**会改变结构体布局的选项（`CONFIG_PM`、`CONFIG_USB_OTG`、`CONFIG_SECURITY` 等）
   如果与固件真配置不同，仍可能出现 `probe` oops 或字段错位 —— 到时候按 `dmesg`
   崩在哪一行，用同样的办法（`pahole` 看我们的偏移 / `/proc/kallsyms` 找内建符号当判据）去对。
-- 卸载/reload 会让 USB 重新枚举一次（复位策略的副作用）：`rmmod` + `insmod` 到出节点
-  约 14s（重新枚举 ~7s + `smit_init` 的固定延时 ~7s）。开机不受影响。
-- 万一遇到硬断电（复位通知跑不到），开机第一次 probe 仍会失败一次并靠复位自愈，
-  约 7s 后恢复，不会永久失败。
+- 冷启动那 10s 里有 7s 是芯片固件重启后的 USB 枚举，主机侧压不掉
+  （插拔 dongle、`reset_on_exit=1` 强制复位都会走这条路）。
+- 热芯片复用的前提是"上一次初始化是完整的"。如果芯片处于半死状态（例如上一次
+  `smit_init()` 中途被拔线），`module_init` 的 ping 会超时，走复位重建，不会卡死。
 - `FE_READ_BER` / `FE_READ_UNCORRECTED_BLOCKS` 返回 `ENOTSUPP`，驱动没实现；
   `dvr0` 在未设置 demux 输出前 open 会返回 `ENOTSUP`，设好 PID 过滤后可读。
+
+## 调试参数
+
+```
+insmod dvb-usb-smit.ko trace=1          # 打印 smit_init 每条命令的耗时
+insmod dvb-usb-smit.ko diag_probe=1     # 打印描述符 + 5 个 vendor control 请求的应答
+insmod dvb-usb-smit.ko reset_on_exit=1  # 卸载时复位芯片，强制下一次 probe 走冷启动
+insmod dvb-usb-smit.ko skip_wake=1      # 跳过唤醒直接跑初始化（复现"热芯片被 init 打死"）
+```
+

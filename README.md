@@ -79,6 +79,16 @@ USB 主机侧不用管：设备已经加载了 `xhci_hcd` / `xhci_mtk_hcd` / `xh
 - `NO_RC=1`：驱动 `properties` 里没有 `.rc`，遥控走空实现，行为等价但少一个 `rc-core.ko`
 - `KBUILD_MODPOST_WARN=1`：没有内核的 `Module.symvers`，未解析符号是预期的
 
+这套配置是"仿真"出来的：CI 拿不到设备那棵 OpenWrt 树，只能按 `configs/` 里的
+delta 拼一份，再用 `struct module = 704` / `i_rdev = 68` 两条断言反向确认没偏。
+
+**想在 OpenWrt / PonWrt 源码树里直接编成 `.ipk`**（不用这一套仿真）见
+[`openwrt/README.md`](openwrt/README.md)：把 `openwrt/Makefile` 放进
+`package/kernel/dvb-usb-smit/Makefile`、仓库 clone 到同目录的 `repo/`，
+`make menuconfig` 选中 `kmod-dvb-usb-smit` 即可。前提是那棵树就是本设备
+（an7581 / 6.18.55）的配置 —— 换个 target 编出来 `struct module` 大小不同，
+`insmod` 直接拒收。
+
 ## 关键坑：`struct module` 大小必须逐字匹配
 
 `insmod` 会校验 `.gnu.linkonce.this_module` 段的字节数是否等于内核里
@@ -572,6 +582,7 @@ A/B 实测：同一脚本、同一频点，反复调谐 15 次后观察 40 次 `
 
 ```
 configs/   OpenWrt generic + target 内核配置 delta
+openwrt/   OpenWrt/PonWrt 包（KernelPackage 定义 + 产物校验脚本）
 src/       smit.c(协议) icast-fe.c(前端) icast-smit.c(桥接) + 头文件
 scripts/   ci-prep-config.sh（合成 .config） prepare-src.sh（抠 DVB 源码到 kern/）
 Makefile   kbuild 包装：dvb-core / dvb-usb / dvb-usb-smit

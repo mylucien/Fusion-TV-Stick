@@ -90,7 +90,8 @@ jobs:
                    KPROBES LIVEPATCH BPF_EVENTS KUNIT TREE_SRCU JUMP_LABEL KALLSYMS \
                    DEBUG_INFO_BTF_MODULES PRINTK_INDEX GENERIC_BUG SMP SYSFS \
                    MODULE_SIG MODULE_UNLOAD STACKTRACE_BUILD_ID HAVE_STATIC_CALL_INLINE \
-                   ARCH_USES_CFI_TRAPS MODULES_TREE_LOOKUP MODULE_DEBUG MODULE_STATS; do
+                   ARCH_USES_CFI_TRAPS MODULES_TREE_LOOKUP MODULE_DEBUG MODULE_STATS \
+                   PERF_EVENTS TRACING CFI ARM_PMU HW_PERF_EVENTS EXPERT; do
             v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1 || true)
             printf "   %-26s %s\n" "$k" "${v:-<absent>}"
           done

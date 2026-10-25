@@ -116,11 +116,14 @@ OVR = [
     ('LTO_CLANG', None),
     ('LTO_NONE', 'y'),
     # ---- struct module 布局：设备 sizeof(struct module)=704 ----
-    # MODULES_TREE_LOOKUP=y 会给每个 struct module_memory 加一个
-    # struct mod_tree_node mtn(56B)，mem[7] 共多出 392B，
+    # MODULES_TREE_LOOKUP 是 "def_bool y; depends on PERF_EVENTS || TRACING || CFI"，
+    # 没有 prompt 所以不能直接写 n，只能把三个依赖全部关掉。
+    # 它是 struct module_memory.mtn(56B) 的来源：mem[7] 共多出 392B，
     # 使 .gnu.linkonce.this_module 从 704 涨到 1088，insmod 报
     # "section size must match the kernel's built struct module size"。
-    ('MODULES_TREE_LOOKUP', None),
+    ('PERF_EVENTS', None),
+    ('TRACING', None),
+    ('CFI', None),
     ('MODULE_DEBUG', None),
     ('MODULE_STATS', None),
     ('MODULE_UNLOAD_TAINT_TRACKING', None),

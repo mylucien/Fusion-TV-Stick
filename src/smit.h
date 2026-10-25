@@ -23,6 +23,13 @@ static inline int smit_is_transport_err(int ret)
 /* 调试开关，定义在 icast-smit.c，供本文件打点用 */
 extern bool smit_trace;
 
+/* 运行时自愈开关，同样定义在 icast-smit.c */
+extern bool smit_autorecover;
+
+/* 命令通道连续失败达到阈值时，由 smit.c 调用：复位芯片让它重新枚举，
+ * 这样不需要用户手动拔插。实现见 icast-smit.c。 */
+void smit_schedule_recovery(struct usb_device *udev);
+
 int smit_reset(struct usb_device *udev);
 int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag);
 int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount);

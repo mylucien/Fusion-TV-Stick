@@ -144,6 +144,12 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   };
   u8 buf[900];
 
+  /* 先把状态明确置 0。原来这条失败分支直接 return 0 而没写 *status，
+   * 上层拿到的是 dvb_frontend_ioctl 栈上的未初始化变量：里面可能刚好带着
+   * FE_HAS_LOCK 位，于是一次读失败之后播放器会一直以为"还锁着"，
+   * 画面对着不动的画面永远不恢复，看起来就像驱动挂了。 */
+  *status = 0;
+
   smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50);
 
   if ( smit_tuner_stat(priv->dev->udev, buf, 5) != 32 )

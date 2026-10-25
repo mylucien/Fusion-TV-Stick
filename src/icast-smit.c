@@ -13,6 +13,7 @@
 #include <linux/jiffies.h>
 #include <linux/moduleparam.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -46,8 +47,10 @@ static struct icast_fe_config icast_config = {
  *                 （用来复现"热芯片重跑 init 会把自己打死"）
  * reset_on_exit : 卸载时做硬件复位，强制下一次 probe 走冷启动路径
  * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
+ * autorecover   : 命令通道连续失败时自动复位芯片重新枚举（默认开）
  */
 bool smit_trace;
+bool smit_autorecover = true;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
 static bool smit_diag_probe;
@@ -60,6 +63,8 @@ module_param_named(reset_on_exit, smit_reset_on_exit, bool, 0644);
 MODULE_PARM_DESC(reset_on_exit, "hardware-reset the chip on disconnect (forces a cold next probe)");
 module_param_named(diag_probe, smit_diag_probe, bool, 0644);
 MODULE_PARM_DESC(diag_probe, "dump descriptors and vendor control replies during probe");
+module_param_named(autorecover, smit_autorecover, bool, 0644);
+MODULE_PARM_DESC(autorecover, "reset the chip to re-enumerate when the command channel dies");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -247,6 +252,25 @@ static int smit_ping(struct usb_device *udev)
  * devnum 每次重新枚举都会变，所以它同时充当"这个芯片还是不是当年那个"的凭据。 */
 static int smit_warm_devnum = -1;
 
+/* 复位是最后手段，也可能是死循环的入口：复位 -> 重新枚举 -> probe 又失败 ->
+ * 再复位，每轮 7s。每次 probe 成功都会把计数清零；连续 SMIT_RECOVER_MAX_CONSEC
+ * 次复位都没换来一次成功就放弃，把设备留在那儿等用户处理，
+ * 总比每 7 秒重置一次强。 */
+#define SMIT_RECOVER_MAX_CONSEC	3
+
+static unsigned smit_reset_attempts;
+
+static bool smit_reset_allowed(void)
+{
+	if (smit_reset_attempts >= SMIT_RECOVER_MAX_CONSEC) {
+		pr_warn("dvb_usb_smit: %u resets without a successful probe, giving up\n",
+			smit_reset_attempts);
+		return false;
+	}
+	smit_reset_attempts++;
+	return true;
+}
+
 /* ---- 芯片状态判定（两个遗留问题的共同解）-----------------------------
  *
  * 目标：热芯片（已经初始化过一次）不要走"复位 -> 重新枚举 7s -> 再 init 7s"。
@@ -275,6 +299,64 @@ static int smit_pick_device(struct usb_device *udev, void *data)
 		return 1;	/* 找到就停 */
 	}
 	return 0;
+}
+
+/* ---- 运行时自愈 -------------------------------------------------------
+ *
+ * 老驱动最讨厌的毛病是"跑一阵子突然不工作了，必须拔掉 USB 重新插"。
+ * 三个结构性原因都在命令通道上：没有互斥（两个调用者的包交错）、
+ * stall 后从不 clear_halt（之后每次传输都立刻 -EPIPE）、轮询重试没有时间上限
+ * （一条 ioctl 卡几十秒）。前两个在 smit.c 里修了，这里补最后一环：
+ *
+ * 连续 SMIT_RECOVER_STREAK 次事务在传输层失败，就当芯片真的卡死了，
+ * 发一次硬件复位让它重新枚举。复位后 device 会 disconnect 再 probe，
+ * 因为这里把 smit_warm_devnum 清成 -1，probe 会走完整的冷启动流程
+ * （唤醒 + 初始化），节点自己回来 —— 不需要人拔插。
+ *
+ * 必须放在 workqueue 里做：复位会触发 disconnect -> dvb_usb_device_exit，
+ * 如果在 frontend ioctl 的上下文里同步做，等于在自己还没退出的时候就
+ * 把自己的设备拆掉，风险太大。异步做就是把这件事交还给 USB 核心。
+ */
+static struct usb_device *smit_recover_udev;
+static atomic_t smit_recover_queued = ATOMIC_INIT(0);
+
+static void smit_recover_work_fn(struct work_struct *work)
+{
+	struct usb_device *udev = smit_recover_udev;
+
+	smit_recover_udev = NULL;
+
+	if (udev) {
+		if (udev->state != USB_STATE_NOTATTACHED) {
+			pr_warn("dvb_usb_smit: command channel dead, resetting chip to re-enumerate\n");
+			/* 复位后 devnum 会变，下一次 probe 因此不会命中"热芯片复用"，
+			 * 而是走完整冷启动。 */
+			smit_warm_devnum = -1;
+			if (smit_reset_allowed())
+				pr_warn("dvb_usb_smit: recovery reset returned %d\n",
+					smit_reset(udev));
+		}
+		usb_put_dev(udev);
+	}
+	atomic_set(&smit_recover_queued, 0);
+}
+
+static DECLARE_WORK(smit_recover_work, smit_recover_work_fn);
+
+void smit_schedule_recovery(struct usb_device *udev)
+{
+	if (!smit_autorecover)
+		return;
+	if (atomic_xchg(&smit_recover_queued, 1))
+		return;		/* 已经排了一个，别叠 */
+
+	usb_get_dev(udev);
+	smit_recover_udev = udev;
+	if (!schedule_work(&smit_recover_work)) {
+		smit_recover_udev = NULL;
+		usb_put_dev(udev);
+		atomic_set(&smit_recover_queued, 0);
+	}
 }
 
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
@@ -313,7 +395,8 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 		dev_info(&udev->dev,
 			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
-		smit_reset(udev);
+		if (smit_reset_allowed())
+			smit_reset(udev);
 		return ret;
 	}
 do_init:
@@ -322,7 +405,7 @@ do_init:
 		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
 		/* 实验模式下不要复位：否则同一次 insmod 里会不断
 		 * 复位→重枚举→再失败，变成死循环 */
-		if (!smit_skip_wake)
+		if (!smit_skip_wake && smit_reset_allowed())
 			smit_reset(udev);
 		return ret;
 	}
@@ -334,11 +417,15 @@ do_init:
 register_device:
 	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
 				  adapter_nr);
-	if (ret == 0)
+	if (ret == 0) {
+		/* 一次成功的 probe 说明链路是好的，把自愈计数清零 */
+		smit_reset_attempts = 0;
 		return 0;
+	}
 
 	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
-	smit_reset(udev);
+	if (smit_reset_allowed())
+		smit_reset(udev);
 	return ret;
 }
 
@@ -387,7 +474,7 @@ static int __init smit_module_init(void)
 
 			pr_info("dvb_usb_smit: cold chip (ping %d), resetting it for a clean probe\n",
 				ret);
-			smit_reset(udev);
+			smit_reset(udev);	/* 加载时第一次清 FIFO，计入尝试次数 */
 
 			/* 复位是"发完命令才重启"，实测要 ~0.8s 才真正从总线上消失。
 			 * 如果这时就去 usb_register，probe 会撞上一个正在重启的设备
@@ -412,6 +499,9 @@ static int __init smit_module_init(void)
 
 static void __exit smit_module_exit(void)
 {
+	/* 先掐掉可能排着队的自愈复位：它持有 udev 的引用，
+	 * 不能让它在模块卸载之后还去碰设备 */
+	cancel_work_sync(&smit_recover_work);
 	usb_deregister(&smit_driver);
 }
 

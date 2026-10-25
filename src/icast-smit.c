@@ -46,11 +46,13 @@ static struct icast_fe_config icast_config = {
  *                 （用来复现"热芯片重跑 init 会把自己打死"）
  * reset_on_exit : 卸载时做硬件复位，强制下一次 probe 走冷启动路径
  * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
+ * ping_first    : 先发 bulk 探针判断芯片是否已初始化（热芯片直接复用）
  */
 bool smit_trace;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
 static bool smit_diag_probe;
+static bool smit_ping_first;
 
 module_param_named(trace, smit_trace, bool, 0644);
 MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
@@ -60,6 +62,8 @@ module_param_named(reset_on_exit, smit_reset_on_exit, bool, 0644);
 MODULE_PARM_DESC(reset_on_exit, "hardware-reset the chip on disconnect (forces a cold next probe)");
 module_param_named(diag_probe, smit_diag_probe, bool, 0644);
 MODULE_PARM_DESC(diag_probe, "dump descriptors and vendor control replies during probe");
+module_param_named(ping_first, smit_ping_first, bool, 0644);
+MODULE_PARM_DESC(ping_first, "probe the chip with a bulk command and skip init when it already answers");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -119,8 +123,8 @@ static struct dvb_usb_device_properties icast_properties = {
  * 冷芯片唤醒实测：第一次就应答（0 ms）；热芯片重试 9 次 / 6270 ms 全超时，
  * 所以 1s 预算足够，没必要拉长。
  */
-#define SMIT_WAKE_BUDGET_MS	1000
-#define SMIT_WAKE_TIMEOUT_MS	500
+#define SMIT_WAKE_BUDGET_MS	4000
+#define SMIT_WAKE_TIMEOUT_MS	300
 #define SMIT_WAKE_BUF_SIZE	512
 
 static int smit_wake(struct usb_device *udev)
@@ -175,7 +179,7 @@ static int smit_wake(struct usb_device *udev)
 		if (time_after_eq(jiffies, deadline))
 			break;
 
-		msleep(200);
+		msleep(100);
 	}
 
 	dev_info(&udev->dev,
@@ -185,21 +189,8 @@ static int smit_wake(struct usb_device *udev)
 	return ret;
 }
 
-/* ---- 芯片状态判定 ----------------------------------------------------
- *
- * 目标：热芯片（已经初始化过一次）不要走"复位 -> 重新枚举 7s -> 再 init"。
- *
- * 踩过的坑：用 bulk OUT 发一条命令当探针是**不可行**的 —— 冷芯片收不到应答
- * 没关系，但那几个字节已经躺进设备的 OUT FIFO 了，紧跟着发的唤醒包
- * FE 00 10 00 会被拼成一条畸形命令，握手必然失败；probe 失败又触发复位，
- * 复位后重新枚举、再次探测、再次污染…… 实测会无限循环。
- *
- * 所以探针必须是非侵入的：只能用 control 请求，或者直接看枚举时就已读到的
- * 设备描述符。冷芯片（固件还在 bootloader 里）和应用固件很可能报不同的
- * bcdDevice / 字符串描述符，那样判定就是零开销的。
- * diag_probe=1 时会把描述符和几个 vendor 请求的应答打出来，冷热各采一次
- * 就能确定该用哪个字段。
- */
+/* 采集冷/热芯片的描述符与 vendor control 应答（diag_probe=1）。
+ * 实测两者完全一致，没有区分度，留着只为以后换芯片/固件时快速复测。 */
 static void smit_diag(struct usb_device *udev)
 {
 	const struct usb_device_descriptor *d = &udev->descriptor;
@@ -238,12 +229,56 @@ static void smit_diag(struct usb_device *udev)
 		if (ret > 0) {
 			buf[ret] = 0;
 			dev_info(&udev->dev, "diag: iProduct=\"%s\"\n", buf);
-		} else {
-			dev_info(&udev->dev, "diag: usb_string(iProduct) -> %d\n", ret);
 		}
 	}
 }
 
+/* 非阻塞探针：发一条 "req 0x82 读 1 字节" 的合法命令，等 100ms 应答。
+ * 热芯片 0ms 就回；冷芯片必然超时（而且这 5 个字节会留在它 OUT FIFO 里，
+ * 见下面 smit_probe 的注释）。 */
+#define SMIT_PING_RECV_TIMEOUT_MS	100
+
+static int smit_ping(struct usb_device *udev)
+{
+	u8 buf[64];
+	int size, ret;
+
+	/* 包格式与 smit_set() 一致：tag, byte2, req, datalen, data[0] */
+	buf[0] = 0x01;
+	buf[1] = 0x00;
+	buf[2] = 0x82;
+	buf[3] = 0x01;
+	buf[4] = 0x01;
+
+	ret = usb_bulk_msg(udev,
+		usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
+		buf, 5, &size, SMIT_WAKE_TIMEOUT_MS);
+	if (ret)
+		return ret;
+
+	ret = usb_bulk_msg(udev,
+		usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
+		buf, sizeof(buf), &size, SMIT_PING_RECV_TIMEOUT_MS);
+	if (ret == -EOVERFLOW)	/* 数据比缓冲区多，包其实收到了 */
+		ret = 0;
+	return ret;
+}
+
+/* ---- 芯片状态判定 ----------------------------------------------------
+ *
+ * 目标：热芯片（已经初始化过一次）不要走"复位 -> 重新枚举 7s -> 再 init"。
+ *
+ * 已经被证伪的手段：
+ *   - 设备描述符 / 字符串 / vendor control 请求：冷热完全一样
+ *     （bcdDevice=0200、iProduct="DONGLE"、几个 0xC0 请求一律 -11），零区分度。
+ *   - 所以只能用 bulk 命令探活。而这就带来一个副作用：冷芯片收不到应答时，
+ *     探针的 5 个字节已经留在它的 OUT FIFO 里，紧跟着的唤醒包
+ *     FE 00 10 00 可能被拼成畸形命令，握手失败 -> probe 失败 -> 复位 ->
+ *     重枚举 -> 再探测 -> 再污染，实测会无限循环。
+ *
+ * 因此唤醒包给了 4s 预算（原来 1s 只够试 2 次），靠重复发送把 FIFO 里
+ * 的残留冲刷掉。ping_first=1 打开这条新路径，0 保持原来的"唤醒优先"。
+ */
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
@@ -254,6 +289,19 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 	if (smit_skip_wake)
 		goto do_init;
+
+	if (smit_ping_first) {
+		ret = smit_ping(udev);
+		if (!smit_is_transport_err(ret)) {
+			dev_info(&udev->dev,
+				 "ping ok (%d): chip already initialized, skipping wake + init\n",
+				 ret);
+			goto register_device;
+		}
+		dev_info(&udev->dev,
+			 "ping failed (%d): cold chip, winding up the wake sequence\n",
+			 ret);
+	}
 
 	ret = smit_wake(udev);
 	if (ret) {
@@ -280,6 +328,7 @@ do_init:
 		 * 这里只记录，免得把本来能用的设备判死 */
 		dev_info(&udev->dev, "init sequence reported %d, continuing\n", ret);
 
+register_device:
 	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
 				  adapter_nr);
 	if (ret == 0)

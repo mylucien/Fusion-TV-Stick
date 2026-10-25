@@ -79,6 +79,26 @@ jobs:
             ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
             NO_RC=1 KBUILD_MODPOST_WARN=1 -j$(nproc) 2>&1 | tee build.log
 
+      - name: 诊断：关键 CONFIG 与 struct module 大小
+        if: always()
+        run: |
+          set -uo pipefail
+          K=$HOME/kernel/linux-${KVER}/.config
+          cp -f "$K" ./kernel.config || true
+          echo "===== 影响 struct module 布局的开关 ====="
+          for k in TRACEPOINTS TRACING EVENT_TRACING DYNAMIC_FTRACE FUNCTION_TRACER \
+                   KPROBES LIVEPATCH BPF_EVENTS KUNIT TREE_SRCU JUMP_LABEL KALLSYMS \
+                   DEBUG_INFO_BTF_MODULES PRINTK_INDEX GENERIC_BUG SMP SYSFS \
+                   MODULE_SIG MODULE_UNLOAD STACKTRACE_BUILD_ID HAVE_STATIC_CALL_INLINE \
+                   ARCH_USES_CFI_TRAPS; do
+            v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1)
+            printf "   %-26s %s\n" "$k" "${v:-<absent>}"
+          done
+          echo "===== .gnu.linkonce.this_module 段大小（设备要求 704）====="
+          if [ -f dvb-core.ko ]; then
+            aarch64-linux-gnu-objdump -h dvb-core.ko | grep -E "this_module" || true
+          fi
+
       - name: 校验产物
         run: |
           set -euo pipefail
@@ -97,4 +117,5 @@ jobs:
           path: |
             *.ko
             build.log
+            kernel.config
           if-no-files-found: error

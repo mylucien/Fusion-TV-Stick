@@ -25,9 +25,9 @@ ARCH ?= arm64
 NO_RC ?= 1
 
 ccflags-y += -DCONFIG_DVB_NET
-ccflags-y += -I$(KSRC)/dvb-core
-ccflags-y += -I$(KSRC)/dvb-usb
-ccflags-y += -I$(KSRC)/rc
+ccflags-y += -Ikern/dvb-core
+ccflags-y += -Ikern/dvb-usb
+ccflags-y += -Ikern/rc
 ccflags-y += -I$(SRC_DIR)
 
 # ---- dvb-core -------------------------------------------------------------
@@ -36,42 +36,42 @@ ccflags-y += -I$(SRC_DIR)
 # provides static inline stubs for that case).
 obj-m += dvb-core.o
 dvb-core-objs := \
-	$(KSRC)/dvb-core/dvbdev.o \
-	$(KSRC)/dvb-core/dmxdev.o \
-	$(KSRC)/dvb-core/dvb_demux.o \
-	$(KSRC)/dvb-core/dvb_ca_en50221.o \
-	$(KSRC)/dvb-core/dvb_frontend.o \
-	$(KSRC)/dvb-core/dvb_net.o \
-	$(KSRC)/dvb-core/dvb_ringbuffer.o
+	kern/dvb-core/dvbdev.o \
+	kern/dvb-core/dmxdev.o \
+	kern/dvb-core/dvb_demux.o \
+	kern/dvb-core/dvb_ca_en50221.o \
+	kern/dvb-core/dvb_frontend.o \
+	kern/dvb-core/dvb_net.o \
+	kern/dvb-core/dvb_ringbuffer.o
 
 # ---- dvb-usb --------------------------------------------------------------
 obj-m += dvb-usb.o
 dvb-usb-objs := \
-	$(KSRC)/dvb-usb/dvb-usb-init.o \
-	$(KSRC)/dvb-usb/dvb-usb-urb.o \
-	$(KSRC)/dvb-usb/dvb-usb-i2c.o \
-	$(KSRC)/dvb-usb/dvb-usb-dvb.o \
-	$(KSRC)/dvb-usb/dvb-usb-firmware.o \
-	$(KSRC)/dvb-usb/usb-urb.o
+	kern/dvb-usb/dvb-usb-init.o \
+	kern/dvb-usb/dvb-usb-urb.o \
+	kern/dvb-usb/dvb-usb-i2c.o \
+	kern/dvb-usb/dvb-usb-dvb.o \
+	kern/dvb-usb/dvb-usb-firmware.o \
+	kern/dvb-usb/usb-urb.o
 
 ifeq ($(NO_RC),1)
-dvb-usb-objs += $(SRC_DIR)/dvb-usb-remote-stub.o
+dvb-usb-objs += src/dvb-usb-remote-stub.o
 else
 obj-m += rc-core.o
-rc-core-objs := $(KSRC)/rc/rc-main.o $(KSRC)/rc/rc-ir-raw.o
-dvb-usb-objs += $(KSRC)/dvb-usb/dvb-usb-remote.o
+rc-core-objs := kern/rc/rc-main.o kern/rc/rc-ir-raw.o
+dvb-usb-objs += kern/dvb-usb/dvb-usb-remote.o
 endif
 
 # ---- the driver itself ----------------------------------------------------
 # smit.c (protocol + bridge) and icast-fe.c (frontend) are one module, so the
 # frontend is called directly instead of through dvb_attach()/symbol_request().
 obj-m += dvb-usb-smit.o
-dvb-usb-smit-objs := $(SRC_DIR)/smit.o $(SRC_DIR)/icast-fe.o $(SRC_DIR)/icast-smit.o
+dvb-usb-smit-objs := src/smit.o src/icast-fe.o src/icast-smit.o
 
 # ---- build ----------------------------------------------------------------
 all:
 	@test -d "$(KERNEL_DIR)" || { echo "KERNEL_DIR not set/exists: $(KERNEL_DIR)"; exit 1; }
-	@test -d "$(KSRC)/dvb-core" || { echo "run scripts/prepare-src.sh first"; exit 1; }
+	@test -d "kern/dvb-core" || { echo "run scripts/prepare-src.sh first"; exit 1; }
 	$(MAKE) -C $(KERNEL_DIR) M=$(CURDIR) ARCH=$(ARCH) \
 		CROSS_COMPILE=$(CROSS_COMPILE) NO_RC=$(NO_RC) modules
 

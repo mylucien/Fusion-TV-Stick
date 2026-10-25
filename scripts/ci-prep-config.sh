@@ -1,39 +1,63 @@
 #!/usr/bin/env bash
-# 把 OpenWrt 的 generic + target 两份 delta 配置合并成完整 .config，
-# 再把关键项对齐到设备内核（vermagic / 模块化程度 / 结构体布局相关开关）。
+# 生成 arm64 内核 .config：arm64 defconfig 打底 -> 叠加 OpenWrt generic+target
+# 两份 delta -> 强制覆盖 vermagic / 模块化程度相关开关 -> olddefconfig。
 #
-# 用法:  KERNEL_DIR=/path/to/linux-6.18.55 ./scripts/ci-prep-config.sh
+# 用法:  KERNEL_DIR=/path/to/linux-6.18.55 bash scripts/ci-prep-config.sh
 set -euo pipefail
 
 KERNEL_DIR="${KERNEL_DIR:?set KERNEL_DIR}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$KERNEL_DIR"
 
-echo "== 1. 合并 generic + target（后者覆盖前者）=="
+ARCH=${ARCH:-arm64}
+
+echo "== 0. $ARCH defconfig 打底（保证基础能力齐全）=="
+make ARCH="$ARCH" defconfig >/dev/null
+echo "   defconfig entries: $(grep -c '^CONFIG_' .config)"
+
+echo "== 1. 叠加 OpenWrt generic + target delta（后者覆盖前者）=="
 python3 - "$REPO_ROOT/configs" <<'PY'
 import os, re, sys
 cfgdir = sys.argv[1]
-order, val = [], {}
+
+lines = open('.config').read().split('\n')
+if lines and lines[-1] == '':
+    lines.pop()
+
+idx = {}
+for i, ln in enumerate(lines):
+    m = re.match(r'^(?:# )?(CONFIG_[A-Za-z0-9_]+)', ln)
+    if m:
+        idx[m.group(1)] = i
+
+added = rep = 0
 for name in ('generic-config-6.18', 'airoha-an7581-config-6.18'):
-    for line in open(os.path.join(cfgdir, name)):
+    path = os.path.join(cfgdir, name)
+    for line in open(path):
         line = line.rstrip('\n')
         m = re.match(r'^(?:# )?(CONFIG_[A-Za-z0-9_]+)(.*)$', line)
         if not m:
             continue
         k, rest = m.group(1), m.group(2)
         if rest.startswith(' is not set'):
-            val[k] = '# %s is not set' % k
+            new = '# %s is not set' % k
         elif rest.startswith('='):
-            val[k] = k + rest
+            new = k + rest
         else:
             continue
-        if k not in order:
-            order.append(k)
-open('.config', 'w').write('\n'.join(val[k] for k in order) + '\n')
-print('   merged entries:', len(order))
+        if k in idx:
+            lines[idx[k]] = new
+            rep += 1
+        else:
+            idx[k] = len(lines)
+            lines.append(new)
+            added += 1
+
+open('.config', 'w').write('\n'.join(lines) + '\n')
+print('   delta overrides: %d replaced / %d appended' % (rep, added))
 PY
 
-echo "== 2. 覆盖关键项 =="
+echo "== 2. 强制覆盖关键项 =="
 python3 <<'PY'
 import re
 OVR = [
@@ -47,15 +71,22 @@ OVR = [
     ('PREEMPT_RT', None),
     ('PREEMPT_VOLUNTARY', None),
     ('PREEMPT_DYNAMIC', None),
+    ('PREEMPT_LAZY', None),
+    ('PREEMPT_NONE', 'y'),
     # ---- 签名 / 调试 / BTF：避免额外依赖 ----
     ('MODULE_SIG', None),
     ('MODULE_SIG_ALL', None),
     ('MODULE_COMPRESS', None),
+    ('MODULE_COMPRESS_ZSTD', None),
+    ('MODULE_COMPRESS_XZ', None),
+    ('MODULE_COMPRESS_GZIP', None),
     ('DEBUG_INFO', None),
     ('DEBUG_INFO_BTF', None),
     ('DEBUG_INFO_DWARF5', None),
     ('GDB_SCRIPTS', None),
     ('SYSTEM_TRUSTED_KEYRING', None),
+    ('SYSTEM_BLACKLIST_KEYRING', None),
+    ('KALLSYMS', 'y'),
     # ---- USB：设备上 usbcore.ko 是模块，必须同为 m ----
     ('USB_SUPPORT', 'y'),
     ('USB', 'm'),
@@ -65,6 +96,7 @@ OVR = [
     ('USB_XHCI_MTK', 'm'),
     ('USB_XHCI_PCI', None),
     ('USB_XHCI_PCI_RENESAS', None),
+    ('USB_XHCI_MTK_DEBUGFS', None),
     # ---- Media / DVB：设备上 mc/videodev/videobuf2 是模块，MEDIA_CONTROLLER=y ----
     ('MEDIA_SUPPORT', 'm'),
     ('MEDIA_CONTROLLER', 'y'),
@@ -75,9 +107,14 @@ OVR = [
     ('DVB_USB', 'm'),
     ('DVB_MMAP', None),
     ('RC_CORE', None),
+    ('I2C', 'y'),
+    ('I2C_CORE', 'y'),
     # ---- 其它 ----
     ('TRIM_UNUSED_KSYMS', None),
     ('UNUSED_KSYMS_WHITELIST', '""'),
+    ('CFI_CLANG', None),
+    ('LTO_CLANG', None),
+    ('LTO_NONE', 'y'),
 ]
 
 lines = open('.config').read().split('\n')
@@ -100,13 +137,18 @@ print('   overrides applied:', len(OVR))
 PY
 
 echo "== 3. olddefconfig =="
-make ARCH=arm64 olddefconfig >/dev/null
+make ARCH="$ARCH" olddefconfig >/dev/null
 
 echo "== 4. 关键项核对 =="
-for k in LOCALVERSION SMP MODULE_UNLOAD MODVERSIONS PREEMPT_NONE PREEMPT_DYNAMIC \
+for k in LOCALVERSION LOCALVERSION_AUTO SMP MODULE_UNLOAD MODVERSIONS \
+         PREEMPT_NONE PREEMPT_DYNAMIC PREEMPT_BUILD \
          USB USB_COMMON USB_XHCI_HCD USB_XHCI_PLATFORM USB_XHCI_MTK \
          MEDIA_SUPPORT MEDIA_CONTROLLER DVB_CORE DVB_USB DVB_MMAP RC_CORE \
-         MODULE_SIG MODULE_SIG_FORCE DEBUG_INFO_BTF TRIM_UNUSED_KSYMS; do
+         MODULE_SIG MODULE_SIG_FORCE DEBUG_INFO DEBUG_INFO_BTF TRIM_UNUSED_KSYMS; do
     v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" .config | head -1 || true)
-    printf "   %-26s %s\n" "$k" "${v:-<未出现>}"
+    printf "   %-24s %s\n" "$k" "${v:-<未出现>}"
 done
+
+echo
+echo "== 5. vermagic 预算 =="
+make -s ARCH="$ARCH" kernelrelease

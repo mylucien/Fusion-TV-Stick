@@ -55,7 +55,8 @@ jobs:
 
       - name: 生成 .config（OpenWrt generic + target 合并）
         run: |
-          KERNEL_DIR=$HOME/kernel/linux-${KVER} ./scripts/ci-prep-config.sh
+          # 用 bash 显式调用：Windows 上提交的脚本可能丢失可执行位
+          KERNEL_DIR=$HOME/kernel/linux-${KVER} bash ./scripts/ci-prep-config.sh
 
       - name: modules_prepare
         run: |
@@ -69,7 +70,7 @@ jobs:
 
       - name: 准备 DVB 栈源码
         run: |
-          KERNEL_DIR=$HOME/kernel/linux-${KVER} NO_RC=1 ./scripts/prepare-src.sh
+          KERNEL_DIR=$HOME/kernel/linux-${KVER} NO_RC=1 bash ./scripts/prepare-src.sh
 
       - name: 编译模块
         run: |

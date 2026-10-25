@@ -11,7 +11,7 @@
 #include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
-#include <linux/reboot.h>
+#include <linux/moduleparam.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -30,31 +30,31 @@
 
 DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
+/* 热芯片跳过初始化时拿不到 tuner 信息，dtmb 只能取默认值。
+ * 必须默认 1（双模 ops）：它同时声明 SYS_DVBT + SYS_DVBC_ANNEX_A，
+ * 是单模 ops 的超集，取错也不会少功能。
+ * 冷启动路径会被 smit_init 里的实际检测覆盖。 */
+static struct icast_fe_config icast_config = {
+	.dtmb = 1,
+};
+
 /* ---- 调试开关（默认全关，不影响正常行为） ----------------------------
  *
- * trace      : 打印 smit_init 每条命令的耗时
- * skip_wake  : probe 时跳过唤醒包，直接跑初始化序列
- *              （用来判定"热芯片到底还不还听得懂命令"）
- * keep_warm  : 卸载时不做硬件复位，把芯片留在"已初始化"的热状态
- *              （配合 skip_wake 做对照实验）
+ * trace         : 打印 smit_init 每条命令的耗时
+ * skip_wake     : probe 时跳过状态判定，直接跑初始化序列
+ *                 （用来复现"热芯片重跑 init 会把自己打死"）
+ * reset_on_exit : 卸载时做硬件复位，强制下一次 probe 走冷启动路径
  */
 bool smit_trace;
 static bool smit_skip_wake;
-static bool smit_keep_warm;
+static bool smit_reset_on_exit;
 
 module_param_named(trace, smit_trace, bool, 0644);
 MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
 module_param_named(skip_wake, smit_skip_wake, bool, 0644);
-MODULE_PARM_DESC(skip_wake, "skip the wake-up packet and go straight to init");
-module_param_named(keep_warm, smit_keep_warm, bool, 0644);
-MODULE_PARM_DESC(keep_warm, "do not hardware-reset the chip on disconnect");
-
-static struct icast_fe_config icast_config = {
-	.dtmb = 0,
-};
-
-/* 当前已成功 probe 的设备，只给重启通知用（重启时把芯片复位回冷状态） */
-static struct usb_device *smit_udev;
+MODULE_PARM_DESC(skip_wake, "skip the state probe and always run the init sequence");
+module_param_named(reset_on_exit, smit_reset_on_exit, bool, 0644);
+MODULE_PARM_DESC(reset_on_exit, "hardware-reset the chip on disconnect (forces a cold next probe)");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -105,21 +105,14 @@ static struct dvb_usb_device_properties icast_properties = {
 	}
 };
 
-/* 唤醒序列 "FE 00 10 00" 只对"刚上电/刚复位、固件还没被初始化过"的芯片有效。
+/* 唤醒序列 "FE 00 10 00" 只对"刚上电、固件还停在等待握手状态"的冷芯片有效。
  *
- * 实测：设备被任何一轮驱动实例初始化过之后，不只是唤醒包，连后续所有命令包的
- * IN 应答都超时（-ETIMEDOUT）——芯片根本不回话，只有 smit_reset() 的硬件复位
- * 能把它救回来，代价是设备重新枚举 6~7 秒。这就是"首次 probe 必失败"的来源。
+ * 必须只在确认为冷芯片之后才发：真机对照实验里，热芯片（已经初始化过一次）
+ * 收到这个包不但不应答，还会让之后的命令全部超时 —— 它本身就是毒药。
+ * 所以调用顺序是先 smit_set(0x82) 探活，探不到才允许发唤醒包。
  *
- * 冷/热芯片的实测对比：复位重新枚举之后 probe，唤醒包第一次就应答（0 ms）；
- * 热芯片则 9 次 / 6270 ms 全超时。所以不需要长重试预算。
- *
- * 处理办法：
- *   - 卸载时（smit_disconnect）复位，让下一次 insmod 的第一次 probe 是干净的；
- *   - 重启/关机时（smit_reboot_notify）也复位，否则下次开机的第一次 probe
- *     会撞上热芯片（路由器重启并不切断 dongle 的状态）；
- *   - probe 里唤醒包只给 1s 预算，不应答就复位返回，不再白跑 smit_init（约 12s）；
- *   - 只有 -EPIPE / -ETIMEDOUT 值得重试。
+ * 冷芯片唤醒实测：第一次就应答（0 ms）；热芯片重试 9 次 / 6270 ms 全超时，
+ * 所以 1s 预算足够，没必要拉长。
  */
 #define SMIT_WAKE_BUDGET_MS	1000
 #define SMIT_WAKE_TIMEOUT_MS	500
@@ -187,9 +180,27 @@ static int smit_wake(struct usb_device *udev)
 	return ret;
 }
 
+/* ---- 芯片状态判定（两个遗留问题的共同解）----------------------------
+ *
+ * 实测结论（2026-10-25，真机对照实验）：
+ *
+ *   热芯片发唤醒包 FE 00 10 00        -> 无应答，且之后所有命令全超时
+ *   热芯片重跑初始化序列              -> cmd0/cmd3 都应答，但 cmd4（写寄存器
+ *                                        0x9F/0x80/0x10）之后固件彻底不回话
+ *   热芯片只发一条命令（不唤醒不 init）-> 立即正常应答（0ms，返回数据）
+ *
+ * 也就是说芯片初始化过一次之后，命令通道一直是活的；把它打死的恰恰是
+ * 我们自己的"重新初始化"。原方案（复位 -> 重新枚举 7s -> 再 init 7s）
+ * 既慢又完全没必要，只是没人试过"直接问一句"。
+ *
+ * 因此 probe 分两条路：
+ *   探测有应答 -> 芯片在应用模式，跳过唤醒和初始化，直接注册前端（约 0ms）
+ *   探测无应答 -> 冷芯片，走唤醒 + 完整初始化（插拔 dongle、整机断电后）
+ */
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
+	u8 cmd0[1] = { 0x01 };
 	int ret;
 
 	if (smit_skip_wake) {
@@ -204,11 +215,21 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 		goto do_init;
 	}
 
+	/* 初始化序列的第一条命令本来就是 req 0x82 的只读查询，拿它当探针：
+	 * 有应答（0 或协议级错误码）说明芯片在应用模式，USB 层错误码说明是冷芯片。 */
+	ret = smit_set(udev, 0x82, cmd0, 1, 0);
+	if (!smit_is_transport_err(ret)) {
+		dev_info(&udev->dev,
+			 "chip is already initialized (probe reply %d), skipping wake + init\n",
+			 ret);
+		goto register_device;
+	}
+
+	dev_info(&udev->dev, "cold chip (probe %d), waking it up\n", ret);
 	ret = smit_wake(udev);
 	if (ret) {
-		/* 固件已经初始化过 / 端点坏了：芯片不会应答任何命令，
-		 * 只能硬件复位让它重新枚举，以干净状态再来一次。
-		 * 这里不要再去试 smit_init —— 那是 20 多条命令 × 500ms 超时。 */
+		/* 唤醒包也没人理：说明芯片卡在既不在应用模式、又听不懂唤醒的
+		 * 中间态。只有硬件复位能救，代价是重新枚举 6~7 秒。 */
 		dev_info(&udev->dev,
 			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
@@ -230,13 +251,11 @@ do_init:
 		 * 这里只记录，免得把本来能用的设备判死 */
 		dev_info(&udev->dev, "init sequence reported %d, continuing\n", ret);
 
+register_device:
 	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
 				  adapter_nr);
-	if (ret == 0) {
-		usb_get_dev(udev);	/* 重启通知里要用，防止 udev 提前释放 */
-		smit_udev = udev;
+	if (ret == 0)
 		return 0;
-	}
 
 	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
 	smit_reset(udev);
@@ -246,41 +265,15 @@ do_init:
 static void smit_disconnect(struct usb_interface *intf)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
-	int ret, i;
-
-	if (smit_udev == udev) {
-		smit_udev = NULL;
-		usb_put_dev(udev);	/* 配平 probe 里的 usb_get_dev */
-	}
-
-	usb_get_dev(udev);	/* 下面的轮询期间保证 udev 不被释放 */
 
 	dvb_usb_device_exit(intf);
 
-	if (smit_keep_warm) {
-		dev_info(&udev->dev, "keep_warm: leaving chip initialized\n");
-		usb_put_dev(udev);
-		return;
-	}
-
-	/* 把芯片复位回"刚插上"的状态。否则下一次 insmod 时固件还在跑，
-	 * 唤醒包和命令包全都超时，probe 必然先失败一次再靠复位自愈。
-	 * 设备已经被拔掉时这个控制请求会返回 -ENODEV，无害。 */
-	ret = smit_reset(udev);
-	dev_info(&udev->dev, "reset on disconnect: %d\n", ret);
-
-	/* 芯片复位是"发完命令才重启"，实测要 ~0.8s 才真正从总线上消失。
-	 * 如果这里立刻返回，紧跟着的 insmod 会 probe 到一个正在重启的设备，
-	 * 必然 -ETIMEDOUT 失败一次。所以等它掉线再走，上限 1.5s。 */
-	for (i = 0; i < 30; i++) {
-		if (udev->state == USB_STATE_NOTATTACHED)
-			break;
-		msleep(50);
-	}
-	if (i)
-		dev_info(&udev->dev, "device detached after %d ms\n", i * 50);
-
-	usb_put_dev(udev);
+	/* 默认不复位芯片。
+	 * 以前这里复位是为了"让下一次 insmod 的第一次 probe 是干净的"，代价是
+	 * 设备重新枚举 7s；现在 probe 会先探活，热芯片直接复用，重新枚举纯属浪费。
+	 * 需要验证冷启动路径时用 reset_on_exit=1 手动复位。 */
+	if (smit_reset_on_exit)
+		dev_info(&udev->dev, "reset on exit: %d\n", smit_reset(udev));
 }
 
 static struct usb_driver smit_driver = {
@@ -290,25 +283,8 @@ static struct usb_driver smit_driver = {
 	.id_table = icast_id_table,
 };
 
-/* 重启/关机时把芯片复位回冷状态。
- * 路由器重启并不会切断 dongle 的供电，芯片会带着"已初始化"的状态活到下一次开机，
- * 于是开机时的第一次 probe 拿到的是热芯片：唤醒包和命令包全部超时，
- * 只能靠复位重新枚举兜底（多绕一次 6~7s 的断连）。
- * 在这里提前复位，下次开机就是冷芯片，第一次 probe 直接成功。 */
-static int smit_reboot_notify(struct notifier_block *nb,
-			      unsigned long action, void *data)
-{
-	struct usb_device *udev = smit_udev;
-
-	if (udev)
-		pr_info("dvb_usb_smit: reset chip for clean next boot: %d\n",
-			smit_reset(udev));
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block smit_reboot_nb = {
-	.notifier_call = smit_reboot_notify,
-};
+/* 重启/关机不再需要任何动作：probe 探测到热芯片会直接复用，不再有
+ * "开机第一次 probe 失败"这回事，reboot_notifier 已删除。 */
 
 static int __init smit_module_init(void)
 {
@@ -319,13 +295,11 @@ static int __init smit_module_init(void)
 		err("usb_register failed. Error number %d", result);
 		return result;
 	}
-	register_reboot_notifier(&smit_reboot_nb);
 	return 0;
 }
 
 static void __exit smit_module_exit(void)
 {
-	unregister_reboot_notifier(&smit_reboot_nb);
 	usb_deregister(&smit_driver);
 }
 

@@ -115,7 +115,9 @@ int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complet
     {
       if ( need_complete_flag )
       {
-        msleep(100);
+        /* 原先这里先 msleep(100) 再去轮询完成标志，一整套初始化序列要付
+         * 10 次 = 1s 的固定开销。smit_check 自己就是从 3ms 起步的退避轮询，
+         * 直接进去等更划算，芯片真有活干也等得住。 */
         return smit_check(udev, need_complete_flag);
       }
     }
@@ -249,7 +251,10 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
     SMIT_DO(smit_tuner_stat(udev, buf, 0));
   }
 
-  SMIT_DO(smit_set(udev, 0xA0, cmd9, 32, 100));
+  /* 这条 cmd9 本身是"调谐"命令，初始化阶段频点全是 0，发出去芯片既不会
+   * 调谐也不会回完成标志 —— 实测在这里白等 4390ms 后拿到 -1100（重试用尽）。
+   * 上游同样忽略它的结果，所以只发不收完成标志。 */
+  SMIT_DO(smit_set(udev, 0xA0, cmd9, 32, 0));
   SMIT_DO(smit_tuner_stat(udev, buf, 20));
   
   if (smit_trace)

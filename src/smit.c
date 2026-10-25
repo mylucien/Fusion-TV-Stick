@@ -80,7 +80,9 @@ int smit_check(struct usb_device *udev, int checkcount)
       break;
     msleep((unsigned int)(cnt / 2 + 3));
   }
-  return -checkcount;
+  /* 归到协议级错误码区间（< -1000），别和 USB 传输层的 errno 混在一起：
+   * 调用方靠这个区间判断是该重试/复位，还是照旧忽略。 */
+  return -(1000 + checkcount);
 }
 
 int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag)

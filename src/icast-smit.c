@@ -81,14 +81,17 @@ static struct dvb_usb_device_properties icast_properties = {
 	}
 };
 
-/* 唤醒序列 "FE 00 10 00" 在第一次 probe 时经常会失败：
- * 上一轮驱动实例退出后 bulk 端点可能还带着 halt（或 data toggle 没复位），
- * 这时 usb_bulk_msg() 会立刻返回 -EPIPE，probe 随即返回 -EINVAL，
- * usbcore 放弃绑定；只能等 smit_reset() 把设备复位重新枚举之后，
- * 第二次 probe 才成功，代价是十几秒的断连。
+/* 唤醒序列 "FE 00 10 00" 只对"刚枚举出来、固件还没被初始化过"的设备有效。
  *
- * 所以这里先清 halt 再发唤醒包，失败按 50/100/150ms 退避重试；
- * 三次全挂才退回 reset 兜底（保持原来"总能自愈"的特性）。 */
+ * 如果设备已经被上一轮驱动实例初始化过（rmmod 再 insmod、或者 modprobe 两次），
+ * 芯片已经在跑固件了，这个包的 IN 应答会超时（-ETIMEDOUT），probe 于是失败，
+ * 只能靠 smit_reset() 把芯片复位、设备重新枚举（约 6~7s）之后第二次 probe 才成功。
+ * 这就是"每次 insmod 第一个 probe 必失败"的来源。
+ *
+ * 处理办法：
+ *   - 端点被 stall（-EPIPE）才值得 clear_halt 重试；
+ *   - 超时说明是"热设备"，不再浪费重试时间，交给调用方按热状态继续初始化；
+ *   - 其它错误（-ENODEV/-ESHUTDOWN 等）才真正失败。 */
 #define SMIT_WAKE_ATTEMPTS	3
 #define SMIT_WAKE_BUF_SIZE	512
 
@@ -112,39 +115,30 @@ static int smit_wake(struct usb_device *udev)
 		memcpy(buf, wake, sizeof(wake));
 		ret = usb_bulk_msg(udev,
 			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
-			buf, sizeof(wake), &size, 1000);
-		if (ret) {
-			dev_warn(&udev->dev,
-				 "wake OUT failed: %d (attempt %d/%d)\n",
-				 ret, attempt, SMIT_WAKE_ATTEMPTS);
-			goto retry;
-		}
+			buf, sizeof(wake), &size, 500);
+		if (ret)
+			goto out;
 
 		ret = usb_bulk_msg(udev,
 			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
-			buf, SMIT_WAKE_BUF_SIZE, &size, 1000);
+			buf, SMIT_WAKE_BUF_SIZE, &size, 500);
 		/* 回包长度不确定：设备给的数据比缓冲区多只会报 EOVERFLOW，
 		 * 这时包其实已经收到了，不算失败 */
 		if (ret == -EOVERFLOW)
 			ret = 0;
-		if (ret) {
-			dev_warn(&udev->dev,
-				 "wake IN failed: %d (attempt %d/%d)\n",
-				 ret, attempt, SMIT_WAKE_ATTEMPTS);
-			goto retry;
+		if (!ret) {
+			kfree(buf);
+			return 0;
 		}
-
-		kfree(buf);
-		return 0;
-retry:
+		/* 只有 stall 才值得重试；超时是"固件不应答"，再试也一样 */
+		if (ret != -EPIPE)
+			break;
 		msleep(50 * attempt);
 	}
 
-	dev_err(&udev->dev,
-		"wake sequence failed after %d attempts, last error %d\n",
-		SMIT_WAKE_ATTEMPTS, ret);
+out:
 	kfree(buf);
-	return ret ? ret : -EIO;
+	return ret;
 }
 
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
@@ -154,13 +148,23 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 
 	ret = smit_wake(udev);
 	if (ret)
-		goto reset_device;
+		/* 热设备：芯片已经在跑固件，唤醒包本来就没人应答。
+		 * 下面重发一遍同样的寄存器配置没有副作用，还省掉一次
+		 * 6~7s 的复位重新枚举。真要是设备没了，smit_init 会以
+		 * 传输层错误失败，再走复位兜底。 */
+		dev_info(&udev->dev,
+			 "wake not answered (%d), assuming device already initialized\n",
+			 ret);
 
 	ret = smit_init(udev, &icast_config.dtmb);
+	if (smit_is_transport_err(ret)) {
+		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
+		goto reset_device;
+	}
 	if (ret)
-		/* 初始化命令的协议级错误上游一直是忽略的，这里只记录不中断，
-		 * 免得把本来能用的设备判死 */
-		dev_warn(&udev->dev, "init sequence reported %d, continuing\n", ret);
+		/* 协议级错误（设备回了怪数据）上游一直是忽略的，
+		 * 这里只记录，免得把本来能用的设备判死 */
+		dev_info(&udev->dev, "init sequence reported %d, continuing\n", ret);
 
 	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
 				  adapter_nr);

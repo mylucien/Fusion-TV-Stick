@@ -90,7 +90,7 @@ jobs:
                    KPROBES LIVEPATCH BPF_EVENTS KUNIT TREE_SRCU JUMP_LABEL KALLSYMS \
                    DEBUG_INFO_BTF_MODULES PRINTK_INDEX GENERIC_BUG SMP SYSFS \
                    MODULE_SIG MODULE_UNLOAD STACKTRACE_BUILD_ID HAVE_STATIC_CALL_INLINE \
-                   ARCH_USES_CFI_TRAPS; do
+                   ARCH_USES_CFI_TRAPS MODULES_TREE_LOOKUP MODULE_DEBUG MODULE_STATS; do
             v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1 || true)
             printf "   %-26s %s\n" "$k" "${v:-<absent>}"
           done
@@ -114,6 +114,7 @@ jobs:
 
       - name: 校验产物
         run: |
+          echo "===== 校验产物 ====="
           set -euo pipefail
           ls -l *.ko
           for f in *.ko; do
@@ -122,6 +123,14 @@ jobs:
             strings -a "$f" | grep -i '^vermagic=' || true
             aarch64-linux-gnu-objdump -f "$f" | grep -E 'architecture|format' || true
           done
+          echo "===== struct module 大小必须 == 704 (0x2c0) ====="
+          hex=$(aarch64-linux-gnu-objdump -h dvb-core.ko | awk '$2==".gnu.linkonce.this_module"{print $3}')
+          dec=$((16#$hex))
+          echo "   .gnu.linkonce.this_module = 0x$hex = $dec"
+          if [ "$dec" -ne 704 ]; then
+            echo "!! 与设备内核的 struct module 大小不一致，insmod 会失败"
+            exit 1
+          fi
 
       - name: 上传 artifacts
         if: always()

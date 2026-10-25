@@ -115,6 +115,15 @@ OVR = [
     ('CFI_CLANG', None),
     ('LTO_CLANG', None),
     ('LTO_NONE', 'y'),
+    # ---- struct module 布局：设备 sizeof(struct module)=704 ----
+    # MODULES_TREE_LOOKUP=y 会给每个 struct module_memory 加一个
+    # struct mod_tree_node mtn(56B)，mem[7] 共多出 392B，
+    # 使 .gnu.linkonce.this_module 从 704 涨到 1088，insmod 报
+    # "section size must match the kernel's built struct module size"。
+    ('MODULES_TREE_LOOKUP', None),
+    ('MODULE_DEBUG', None),
+    ('MODULE_STATS', None),
+    ('MODULE_UNLOAD_TAINT_TRACKING', None),
 ]
 
 lines = open('.config').read().split('\n')

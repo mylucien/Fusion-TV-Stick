@@ -326,9 +326,28 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
   return ret;
 }
 
+/* 故障注入，只用来验证自愈链路：>0 时每条命令直接返回 -ETIMEDOUT，不碰硬件。
+ * 设成 3 再调两次 FE_READ_STATUS（每次两条命令）就能凑满连续失败阈值，
+ * 观察芯片是否会自动复位重新枚举、节点是否自己回来。默认 0，不影响正常行为。 */
+static int smit_fault_test;
+module_param_named(fault_test, smit_fault_test, int, 0644);
+MODULE_PARM_DESC(fault_test, "inject N transport failures to exercise auto recovery");
+
+static bool smit_fault_hit(struct usb_device *udev)
+{
+	if (smit_fault_test <= 0)
+		return false;
+	smit_fault_test--;
+	smit_note(udev, -ETIMEDOUT);
+	return true;
+}
+
 int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complete_flag)
 {
   int ret;
+
+  if (smit_fault_hit(udev))
+    return -ETIMEDOUT;
 
   mutex_lock(&smit_cmd_lock);
   ret = __smit_set(udev, req, data, len, need_complete_flag);
@@ -341,6 +360,9 @@ int smit_set(struct usb_device *udev, u8 req, u8 *data, u8 len, int need_complet
 int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 {
   int ret;
+
+  if (smit_fault_hit(udev))
+    return -ETIMEDOUT;
 
   mutex_lock(&smit_cmd_lock);
   ret = __smit_tuner_stat(udev, out, checkcount);

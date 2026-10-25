@@ -28,8 +28,10 @@
 
 #include "dvb-usb-common.h"
 
-/* Referenced by dvb-usb-common.h; upstream defines it in dvb-usb-remote.c. */
-int dvb_usb_disable_rc_polling;
+/*
+ * 注意：6.18 起 dvb_usb_disable_rc_polling 已由 dvb-usb-init.c 无条件定义
+ * （它同时是 module_param），这里不能再定义，否则 ld -r 报 multiple definition。
+ */
 
 int dvb_usb_remote_init(struct dvb_usb_device *d)
 {

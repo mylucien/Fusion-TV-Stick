@@ -109,6 +109,13 @@ OVR = [
     ('RC_CORE', None),
     ('I2C', 'y'),
     ('I2C_CORE', 'y'),
+    # ---- struct inode 布局：设备 i_rdev @68 ----
+    # 设备 kallsyms 里有 posix_acl_init/posix_acl_alloc 等内建全局符号，
+    # 说明固件 CONFIG_FS_POSIX_ACL=y（OpenWrt 的 delta 里写的是 not set，不可靠）。
+    # 该开关给 struct inode 在 i_flags 之后加 i_acl/i_default_acl 两个指针(+16B)，
+    # 使 i_rdev 从 52 挪到 68。布局不一致时 dvb_device_open() 里的 iminor()
+    # 会读到 i_mapping 的高半(0xffffff80 -> minor=1048448)，因而返回 ENODEV。
+    ('FS_POSIX_ACL', 'y'),
     # ---- 其它 ----
     ('TRIM_UNUSED_KSYMS', None),
     ('UNUSED_KSYMS_WHITELIST', '""'),

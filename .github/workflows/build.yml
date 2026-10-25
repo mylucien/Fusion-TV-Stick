@@ -149,6 +149,9 @@ jobs:
             echo "===== struct $t ====="
             pahole -C "$t" dvb-core.ko 2>&1 | head -80 || true
           done
+          echo "===== struct inode 关键偏移（设备要求 i_rdev = 68）====="
+          pahole -C inode dvb-core.ko 2>/dev/null \
+            | grep -E 'i_mapping|i_ino|i_nlink|i_rdev|i_size' || true
 
       - name: 校验产物
         run: |

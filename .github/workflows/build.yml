@@ -91,7 +91,7 @@ jobs:
                    DEBUG_INFO_BTF_MODULES PRINTK_INDEX GENERIC_BUG SMP SYSFS \
                    MODULE_SIG MODULE_UNLOAD STACKTRACE_BUILD_ID HAVE_STATIC_CALL_INLINE \
                    ARCH_USES_CFI_TRAPS MODULES_TREE_LOOKUP MODULE_DEBUG MODULE_STATS \
-                   PERF_EVENTS TRACING CFI ARM_PMU HW_PERF_EVENTS EXPERT; do
+                   PERF_EVENTS TRACING CFI ARM_PMU HW_PERF_EVENTS EXPERT MEDIA_ATTACH; do
             v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1 || true)
             printf "   %-26s %s\n" "$k" "${v:-<absent>}"
           done
@@ -134,6 +134,15 @@ jobs:
             strings -a "$f" | grep -i '^vermagic=' || true
             aarch64-linux-gnu-objdump -f "$f" | grep -E 'architecture|format' || true
           done
+          echo "===== MEDIA_ATTACH 必须为 n ====="
+          if grep -q '^CONFIG_MEDIA_ATTACH=y' kernel.config; then
+            echo "!! MEDIA_ATTACH=y：dvb_frontend_invoke_release() 会对 ops.release"
+            echo "   调 symbol_put_addr()，而我们没走 dvb_attach()，rmmod 时"
+            echo "   会 module_put 下溢并打 WARNING。"
+            exit 1
+          fi
+          echo "   ok (not set)"
+
           echo "===== struct module 大小必须 == 704 (0x2c0) ====="
           hex=$(aarch64-linux-gnu-objdump -h dvb-core.ko | awk '$2==".gnu.linkonce.this_module"{print $3}')
           dec=$((16#$hex))

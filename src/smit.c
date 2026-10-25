@@ -155,8 +155,15 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
   return ret;
 }
 
+/* 下面这一串初始化命令的返回值上游一直是静默忽略的，设备回怪数据
+ * （-1003/-1004/-1006）也能继续跑。为了让 probe 能区分"设备回了怪数据"
+ * 和"USB 传输本身挂了"，这里把第一个负返回值记下来带出去，
+ * 但流程照旧全部执行，不提前退出。 */
+#define SMIT_DO(expr) do { int __r = (expr); if (__r < 0 && err == 0) err = __r; } while (0)
+
 int smit_init(struct usb_device *udev, u8 *dtmb)
 {
+  int err = 0;
   u8 cmd0[1]  = { 0x01 };
   u8 cmd3[10] = { 0x01, 0x92, 0x07, 0x00, 0x00, 0x01, 0x00, 0x41, 0x00, 0x01};
   u8 cmd4[9]  = { 0x01, 0x90, 0x02, 0x00, 0x01, 0x9F, 0x80, 0x10, 0x00 };
@@ -178,59 +185,61 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
   u8 cmd14[20] = { 0x01, 0x90, 0x02, 0x00, 0x03, 0x9F, 0x9A, 0x07, 0x0B, 0x07, 0x00, 0x08, 0x10, 0x07, 0x00, 0x04, 0x47, 0x44, 0x48, 0x57};
   u8 buf[1000];
 
-  smit_set(udev, 0x82, cmd0, 1, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0x82, cmd0, 1, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
-  smit_set(udev, 0xA0, cmd3, 10, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd3, 10, 0));
 
-  smit_set(udev, 0xA0, cmd4, 9, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd4, 9, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
   cmd4[7] = 0x12;
-  smit_set(udev, 0xA0, cmd4, 9, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd4, 9, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
-  smit_set(udev, 0xA0, cmd5, 37, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd5, 37, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
   cmd3[5] = 0x02;
   cmd3[9] = 0x02;
-  smit_set(udev, 0xA0, cmd3, 10, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd3, 10, 0));
 
   cmd4[4] = 0x02;
   cmd4[7] = 0x20;
-  smit_set(udev, 0xA0, cmd4, 9, 100);
-  smit_tuner_stat(udev, buf, 0);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd4, 9, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
   
-  smit_set(udev, 0xA0, cmd6, 10, 1);
+  SMIT_DO(smit_set(udev, 0xA0, cmd6, 10, 1));
 
-  smit_set(udev, 0xA0, cmd7, 17, 100);
-  smit_tuner_stat(udev, buf, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd7, 17, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
-  smit_set(udev, 0xA0, cmd8, 10, 300);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd8, 10, 300));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
 
-  smit_set(udev, 0xA0, cmd14, 20, 100);
-  smit_tuner_stat(udev, buf, 0);
+  SMIT_DO(smit_set(udev, 0xA0, cmd14, 20, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 0));
   
   *dtmb = strstr(buf + 18, "DTMB:Y") != NULL;
 
   if (!*dtmb)
   {
-    smit_set(udev, 0xA0, cmd10, 10, 0);
+    SMIT_DO(smit_set(udev, 0xA0, cmd10, 10, 0));
     
-    smit_set(udev, 0xA0, cmd11, 9, 0);
-    smit_tuner_stat(udev, buf, 0);
-    smit_tuner_stat(udev, buf, 0);
+    SMIT_DO(smit_set(udev, 0xA0, cmd11, 9, 0));
+    SMIT_DO(smit_tuner_stat(udev, buf, 0));
+    SMIT_DO(smit_tuner_stat(udev, buf, 0));
     
-    smit_set(udev, 0xA0, cmd12, 10, 100);
-    smit_tuner_stat(udev, buf, 0);
+    SMIT_DO(smit_set(udev, 0xA0, cmd12, 10, 100));
+    SMIT_DO(smit_tuner_stat(udev, buf, 0));
   }
 
-  smit_set(udev, 0xA0u, cmd9, 32, 100);
-  smit_tuner_stat(udev, buf, 20);
+  SMIT_DO(smit_set(udev, 0xA0, cmd9, 32, 100));
+  SMIT_DO(smit_tuner_stat(udev, buf, 20));
   
-  return 0;
+  return err;
 }
+
+#undef SMIT_DO

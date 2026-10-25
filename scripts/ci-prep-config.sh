@@ -157,19 +157,55 @@ open('.config', 'w').write('\n'.join(lines) + '\n')
 print('   overrides applied:', len(OVR))
 PY
 
-echo "== 3. olddefconfig =="
+echo "== 3. MEDIA_ATTACH=n（隐藏符号，只能改 Kconfig 默认值）=="
+# dvb_frontend_invoke_release() 里有：
+#     if (release) { release(fe); dvb_detach(release); }
+# 而 dvb_detach() 就是 symbol_put_addr()，是给 dvb_attach() 的 symbol_request()
+# 配对用的。本驱动的前端和 bridge 编在同一个 .ko 里，icast_frontend_attach()
+# 直接调用 icast_fe_attach()，没有 symbol_request，于是 rmmod 时这个 put
+# 会让模块引用计数下溢：
+#     WARNING: CPU: 3 PID: ... at module_put+0x40/0x50
+#     dvb_frontend_put -> dvb_frontend_detach -> dvb_usb_device_exit
+# MEDIA_ATTACH 是 "bool" 没有 prompt（default MODULES），.config 里写 not set
+# 会被 olddefconfig 丢掉，所以直接改 Kconfig 的默认值。关掉后 dvb_attach()
+# 变成直接函数调用、dvb_detach() 变成空语句 —— 正是我们要的语义。
+# 我们只用 dvb-core + dvb-usb 的源码，两者都不含 dvb_attach() 调用，
+# 因此不受影响。
+python3 - <<'PY'
+import re, sys
+p = 'drivers/media/Kconfig'
+s = open(p).read()
+m = re.search(r'^config MEDIA_ATTACH\n(?:[ \t]+[^\n]*\n)+', s, re.M)
+if not m:
+    sys.exit('!! %s 里找不到 MEDIA_ATTACH 定义' % p)
+blk = m.group(0)
+if re.search(r'^[ \t]+default n$', blk, re.M):
+    print('   already default n')
+elif 'default MODULES' in blk:
+    open(p, 'w').write(s.replace(blk, blk.replace('default MODULES', 'default n'), 1))
+    print('   MEDIA_ATTACH: default MODULES -> n')
+else:
+    sys.exit('!! MEDIA_ATTACH 定义与预期不符:\n' + blk)
+PY
+
+echo "== 4. olddefconfig =="
 make ARCH="$ARCH" olddefconfig >/dev/null
 
-echo "== 4. 关键项核对 =="
+echo "== 5. 关键项核对 =="
 for k in LOCALVERSION LOCALVERSION_AUTO SMP MODULE_UNLOAD MODVERSIONS \
          PREEMPT_NONE PREEMPT_DYNAMIC PREEMPT_BUILD \
          USB USB_COMMON USB_XHCI_HCD USB_XHCI_PLATFORM USB_XHCI_MTK \
-         MEDIA_SUPPORT MEDIA_CONTROLLER DVB_CORE DVB_USB DVB_MMAP RC_CORE \
+         MEDIA_SUPPORT MEDIA_CONTROLLER MEDIA_ATTACH DVB_CORE DVB_USB DVB_MMAP RC_CORE \
          MODULE_SIG MODULE_SIG_FORCE DEBUG_INFO DEBUG_INFO_BTF TRIM_UNUSED_KSYMS; do
     v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" .config | head -1 || true)
     printf "   %-24s %s\n" "$k" "${v:-<未出现>}"
 done
 
+if grep -q '^CONFIG_MEDIA_ATTACH=y' .config; then
+    echo "!! MEDIA_ATTACH 仍为 y，rmmod 时 dvb_detach() 会 module_put 下溢"
+    exit 1
+fi
+
 echo
-echo "== 5. vermagic 预算 =="
+echo "== 6. vermagic 预算 =="
 make -s ARCH="$ARCH" kernelrelease

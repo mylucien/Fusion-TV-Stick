@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/version.h>
+#include <linux/delay.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -80,43 +81,99 @@ static struct dvb_usb_device_properties icast_properties = {
 	}
 };
 
+/* 唤醒序列 "FE 00 10 00" 在第一次 probe 时经常会失败：
+ * 上一轮驱动实例退出后 bulk 端点可能还带着 halt（或 data toggle 没复位），
+ * 这时 usb_bulk_msg() 会立刻返回 -EPIPE，probe 随即返回 -EINVAL，
+ * usbcore 放弃绑定；只能等 smit_reset() 把设备复位重新枚举之后，
+ * 第二次 probe 才成功，代价是十几秒的断连。
+ *
+ * 所以这里先清 halt 再发唤醒包，失败按 50/100/150ms 退避重试；
+ * 三次全挂才退回 reset 兜底（保持原来"总能自愈"的特性）。 */
+#define SMIT_WAKE_ATTEMPTS	3
+#define SMIT_WAKE_BUF_SIZE	512
+
+static int smit_wake(struct usb_device *udev)
+{
+	const u8 wake[4] = { 0xFE, 0x00, 0x10, 0x00 };
+	int size, ret = 0, attempt;
+	u8 *buf;
+
+	buf = kmalloc(SMIT_WAKE_BUF_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	for (attempt = 1; attempt <= SMIT_WAKE_ATTEMPTS; attempt++) {
+		/* 清掉可能残留的 stall，同时把 data toggle 复位 */
+		usb_clear_halt(udev,
+			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
+		usb_clear_halt(udev,
+			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE));
+
+		memcpy(buf, wake, sizeof(wake));
+		ret = usb_bulk_msg(udev,
+			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
+			buf, sizeof(wake), &size, 1000);
+		if (ret) {
+			dev_warn(&udev->dev,
+				 "wake OUT failed: %d (attempt %d/%d)\n",
+				 ret, attempt, SMIT_WAKE_ATTEMPTS);
+			goto retry;
+		}
+
+		ret = usb_bulk_msg(udev,
+			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
+			buf, SMIT_WAKE_BUF_SIZE, &size, 1000);
+		/* 回包长度不确定：设备给的数据比缓冲区多只会报 EOVERFLOW，
+		 * 这时包其实已经收到了，不算失败 */
+		if (ret == -EOVERFLOW)
+			ret = 0;
+		if (ret) {
+			dev_warn(&udev->dev,
+				 "wake IN failed: %d (attempt %d/%d)\n",
+				 ret, attempt, SMIT_WAKE_ATTEMPTS);
+			goto retry;
+		}
+
+		kfree(buf);
+		return 0;
+retry:
+		msleep(50 * attempt);
+	}
+
+	dev_err(&udev->dev,
+		"wake sequence failed after %d attempts, last error %d\n",
+		SMIT_WAKE_ATTEMPTS, ret);
+	kfree(buf);
+	return ret ? ret : -EIO;
+}
+
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
-	struct usb_device *udev;
-  int size;
-  int ret;
-  u8 *buf;
+	struct usb_device *udev = interface_to_usbdev(intf);
+	int ret;
 
-  udev = interface_to_usbdev(intf);
+	ret = smit_wake(udev);
+	if (ret)
+		goto reset_device;
 
-  buf = kmalloc(4, GFP_KERNEL);
-  buf[0] = 0xFE;
-  buf[1] = 0x00;
-  buf[2] = 0x10;
-  buf[3] = 0x00;
-  
-  ret = usb_bulk_msg(udev, usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND), buf, 4, &size, 500);
-  if ( ret==0 )
-  {
-    ret = usb_bulk_msg(udev, usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE), buf, 4, &size, 500);
-    if ( ret==0 )
-    {
-	    ret = smit_init(udev, &icast_config.dtmb);
-	    if ( ret==0 )
-    	{
-    		if (0 == dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, 0LL, adapter_nr))
-    		{
-    			kfree(buf);
-    			return 0;
-    		}
-    	}
-    }
-  }
-  
-  smit_reset(udev);
-  kfree(buf);
-  
-  return -EINVAL;
+	ret = smit_init(udev, &icast_config.dtmb);
+	if (ret)
+		/* 初始化命令的协议级错误上游一直是忽略的，这里只记录不中断，
+		 * 免得把本来能用的设备判死 */
+		dev_warn(&udev->dev, "init sequence reported %d, continuing\n", ret);
+
+	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
+				  adapter_nr);
+	if (ret == 0)
+		return 0;
+
+	dev_err(&udev->dev, "dvb_usb_device_init failed: %d\n", ret);
+
+reset_device:
+	/* 兜底：让设备复位并重新枚举，下一次 probe 从干净状态开始。
+	 * 注意复位之后 udev 很快失效，这里只能立刻返回。 */
+	smit_reset(udev);
+	return ret ? ret : -EINVAL;
 }
 
 static struct usb_driver smit_driver = {

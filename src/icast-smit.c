@@ -119,8 +119,8 @@ static struct dvb_usb_device_properties icast_properties = {
  * 冷芯片唤醒实测：第一次就应答（0 ms）；热芯片重试 9 次 / 6270 ms 全超时，
  * 所以 1s 预算足够，没必要拉长。
  */
-#define SMIT_WAKE_BUDGET_MS	4000
-#define SMIT_WAKE_TIMEOUT_MS	300
+#define SMIT_WAKE_BUDGET_MS	1000
+#define SMIT_WAKE_TIMEOUT_MS	500
 #define SMIT_WAKE_BUF_SIZE	512
 
 static int smit_wake(struct usb_device *udev)
@@ -299,7 +299,17 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 	ret = smit_wake(udev);
 	if (ret) {
 		/* 唤醒包也不理：芯片卡在既不在应用模式、又听不懂唤醒的中间态，
-		 * 或者干脆是热芯片（唤醒包对它就是毒药）。只有硬件复位能救。 */
+		 * 或者干脆是热芯片（唤醒包对它就是毒药）。只有硬件复位能救。
+		 *
+		 * 但 -ENODEV / -ESHUTDOWN 是另一回事：设备正在复位/重枚举，
+		 * 这时候再发一次复位只会把 7s 的重枚举又拖一遍。直接放手，
+		 * 等 USB core 在设备重新连上之后再 probe 一次。 */
+		if (ret == -ENODEV || ret == -ESHUTDOWN) {
+			dev_info(&udev->dev,
+				 "device is going away (%d), leaving it to re-enumerate\n",
+				 ret);
+			return ret;
+		}
 		dev_info(&udev->dev,
 			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
@@ -373,9 +383,21 @@ static int __init smit_module_init(void)
 			pr_info("dvb_usb_smit: chip already initialized (devnum %d), will reuse it\n",
 				udev->devnum);
 		} else {
+			int i;
+
 			pr_info("dvb_usb_smit: cold chip (ping %d), resetting it for a clean probe\n",
 				ret);
 			smit_reset(udev);
+
+			/* 复位是"发完命令才重启"，实测要 ~0.8s 才真正从总线上消失。
+			 * 如果这时就去 usb_register，probe 会撞上一个正在重启的设备
+			 * （-ENODEV），再触发一次复位，白等 7s 重枚举。
+			 * 等它断开再注册：设备 7s 后自己重连时会自动 probe 到干净的冷芯片。 */
+			for (i = 0; i < 30; i++) {
+				if (udev->state == USB_STATE_NOTATTACHED)
+					break;
+				msleep(50);
+			}
 		}
 		usb_put_dev(udev);
 	}

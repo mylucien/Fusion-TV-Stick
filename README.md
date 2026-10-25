@@ -16,12 +16,14 @@
 | 插上 dongle 后 probe / 出 `/dev/dvb/adapter0` | ✅ |
 | 打开 `frontend0` 读到 `dvb_frontend_info` | ✅ |
 | 热 reload（`rmmod` + `insmod`）出节点 | ✅ **0.11s**（热芯片直接复用，不复位不重枚举） |
-| 冷启动（插拔 / 复位后） | ✅ 10s（7s USB 枚举 + 2.7s init），一次成功 |
+| 冷启动（插拔 / 复位后） | ✅ 10s（6.7s USB 枚举 + 3.1s 唤醒/init），一次成功 |
 | 整机重启后开机 | ✅ 一次 probe 成功，`probe_failed=0` |
 | 真机重启验证 | ✅ 重启后 `demux0 dvr0 frontend0 net0` 齐全 |
 | 命令通道并发压测（4 线程同一 fd，30s） | ✅ 1488 次 `FE_READ_STATUS`，0 错误 |
 | 长时间持续读状态 | ✅ 5 分钟 4 线程 14412 次，0 超时 / 0 stall / 0 错位 |
 | 通道卡死后自愈（注入故障验证） | ✅ 自动复位重新枚举，节点自己回来，**不用拔插** |
+| 自愈（热复位）总耗时 | **9.8s**（6.7s 枚举 + 3.1s 唤醒/init），两次测量误差 <1ms |
+| 冷启动连做 3 轮 | ✅ 3/3 成功，`init` 2730 / 2730 / 2760 ms |
 
 设备上实测：
 
@@ -265,6 +267,50 @@ ok=2932 timeout=0 epipe=0 resync=0 recover=1 err_streak=0
 救回来了；`resync` 涨 → 出现过错位并被冲刷修正；`recover` 涨 → 触发过自愈复位。
 四个都不动而画面临时断 → 问题在 TS 数据流（`0x84`），不在这条命令通道。
 
+### 自愈（热复位）要多久
+
+`recover=1` 之后是一次完整的冷启动：`vendor reset` → 芯片固件重启 → USB 重新枚举 →
+`probe` → 唤醒 → `smit_init`。真机用 `tools/recover_time.py` 量的，两次结果完全一致：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| 连续 3 次失败 → 发出复位 | ~0 ms | `schedule_work`，异步，不阻塞 ioctl |
+| 复位 → 设备从总线消失 | 0.01s | 命令发完即重启 |
+| 掉线 → 重新枚举完成 | **6.72s** | 芯片固件启动 + USB 枚举，主机侧压不掉 |
+| 枚举 → 前端注册完成 | **3.09s** | 唤醒（0ms）+ `settle_ms`(300) + `smit_init`(2760ms) |
+| **合计（复位 → 节点可用）** | **9.8s** | 两次测量：9.811s / 9.812s |
+
+应用侧看到的时间更长一点：从第一条 error 到节点恢复约 **11.5s**，多出来的是
+应用自己的轮询间隔和恢复后第一次 `open`+`FE_READ_STATUS` 的 1.6s 开销
+（`dvb_frontend_open` 会跑一遍前端 init）。这段时间节点是**不存在**的，
+播放器需要能容忍 `ENOENT` 并重试 `open`；一次 open 失败就放弃的播放器得手动重启它。
+
+6.72s 是硬成本（芯片固件启动），想再压只能让芯片不重启，也就是不走复位这条路。
+
+### 顺带修掉的两个会把自愈拖崩的缺陷
+
+这两个是压测自愈时才暴露的，跟"复位要多久"直接相关：
+
+1. **`smit_drain_in()` 开头无条件 `usb_clear_halt()`** —— 芯片不应答时它一定走满
+   `USB_CTRL_GET_TIMEOUT`（5s）。实测 `init` 里 `cmd3` 花 5580ms、`cmd4` 花 10630ms，
+   正好是「1 次 `clear_halt` + 一次 560ms 的 IN 超时」和「2 次 + 560ms」。
+   触发 `resync` 的原因是**传输超时**，端点并没有 halt，清 halt 纯属自找 5s。
+   后果很严重：芯片死掉时整套 `init` 跑了 **283 秒**（`init sequence took 283340ms`），
+   期间 `rmmod` 完全卡在 D 状态，谁也动不了。→ `drain` 不再 `clear_halt`
+   （真 stall 的路径在 `smit_bulk_in/out` 里单独处理）。
+
+2. **唤醒包应答 ≠ 固件就绪。** 实测撞过一次：`wake answered after 1 attempt(s), 0 ms`
+   之后 560ms 内 `cmd0` 仍然超时，整套 `init` 全 `-110` → 触发自愈复位 → 再撞 →
+   连撞 3 次后 `3 resets without a successful probe, giving up`，设备直接躺那儿不动。
+   唤醒包只是让芯片从 bootloader 跳到应用固件，它回的 ACK 只代表"这条命令收到了"。
+   固件启动时间在软复位后尤其不稳。→ 唤醒成功后 `settle_ms`（默认 300ms）再发第一条命令。
+
+另外 `SMIT_DO` 现在遇到传输层错误就跳过剩余命令：原来芯片已经死了还要把二十多条
+命令一条条发完，每条白等 560ms（十几秒）才让 `probe` 失败。
+
+改完实测：链路坏时单条命令 **10.6s → 0.56s**，`init` 失败从十几秒降到 **<1s**；
+连续 3 轮冷启动 `init` 全部成功（`2730 / 2730 / 2760 ms`），没有再撞上空窗。
+
 ## 目录
 
 ```
@@ -323,7 +369,9 @@ ls /dev/dvb/adapter0/
   **其它**会改变结构体布局的选项（`CONFIG_PM`、`CONFIG_USB_OTG`、`CONFIG_SECURITY` 等）
   如果与固件真配置不同，仍可能出现 `probe` oops 或字段错位 —— 到时候按 `dmesg`
   崩在哪一行，用同样的办法（`pahole` 看我们的偏移 / `/proc/kallsyms` 找内建符号当判据）去对。
-- 冷启动那 10s 里有 7s 是芯片固件重启后的 USB 枚举，主机侧压不掉
+- 冷启动那 10s 里有 6.7s 是芯片固件重启后的 USB 枚举，主机侧压不掉。
+- 自愈复位（命令通道卡死时自动触发）同样要 ~9.8s：6.7s 枚举 + 3.1s 唤醒/init。
+  这段时间节点是**不存在**的，播放器要能容忍 `ENOENT` 并重试 `open`。
   （插拔 dongle、`reset_on_exit=1` 强制复位都会走这条路）。
 - 热芯片复用的前提是"上一次初始化是完整的"。如果芯片处于半死状态（例如上一次
   `smit_init()` 中途被拔线），`module_init` 的 ping 会超时，走复位重建，不会卡死。
@@ -338,6 +386,7 @@ insmod dvb-usb-smit.ko diag_probe=1     # 打印描述符 + 5 个 vendor control
 insmod dvb-usb-smit.ko reset_on_exit=1  # 卸载时复位芯片，强制下一次 probe 走冷启动
 insmod dvb-usb-smit.ko skip_wake=1      # 跳过唤醒直接跑初始化（复现"热芯片被 init 打死"）
 insmod dvb-usb-smit.ko autorecover=0    # 关掉命令通道卡死时的自动复位（默认开）
+insmod dvb-usb-smit.ko settle_ms=0      # 唤醒后不等固件就绪直接发命令（复现空窗竞态）
 ```
 
 运行时可直接读写（不用重新 insmod）：

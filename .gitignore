@@ -1,0 +1,18 @@
+# build outputs
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+kern/
+
+# logs
+build.log
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

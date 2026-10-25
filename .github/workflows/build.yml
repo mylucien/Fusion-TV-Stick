@@ -1,0 +1,98 @@
+name: build-an7581
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: '内核版本（要跟设备 uname -r 完全一致）'
+        required: true
+        default: '6.18.55'
+
+env:
+  KVER: ${{ github.event.inputs.kernel_version || '6.18.55' }}
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+
+jobs:
+  build:
+    # 24.04 自带 gcc-13 交叉工具链，比 22.04 的 gcc-11 更贴近 6.18 的构建要求
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装交叉工具链与内核构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            xz-utils kmod rsync
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 缓存内核源码
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: ~/kernel/linux-${{ env.KVER }}
+          key: kernel-src-${{ env.KVER }}-v1
+
+      - name: 下载并解压内核源码
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/kernel && cd ~/kernel
+          URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz"
+          echo "downloading $URL"
+          curl -fL --retry 3 --retry-delay 3 -o linux-${KVER}.tar.xz "$URL"
+          tar -xf linux-${KVER}.tar.xz
+          rm -f linux-${KVER}.tar.xz
+          ls -d ~/kernel/linux-${KVER}
+
+      - name: 生成 .config（OpenWrt generic + target 合并）
+        run: |
+          KERNEL_DIR=$HOME/kernel/linux-${KVER} ./scripts/ci-prep-config.sh
+
+      - name: modules_prepare
+        run: |
+          make -C $HOME/kernel/linux-${KVER} \
+            ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            -j$(nproc) modules_prepare
+
+      - name: 打印 vermagic 预期值
+        run: |
+          make -s -C $HOME/kernel/linux-${KVER} ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} kernelrelease
+
+      - name: 准备 DVB 栈源码
+        run: |
+          KERNEL_DIR=$HOME/kernel/linux-${KVER} NO_RC=1 ./scripts/prepare-src.sh
+
+      - name: 编译模块
+        run: |
+          make KERNEL_DIR=$HOME/kernel/linux-${KVER} \
+            ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} \
+            NO_RC=1 KBUILD_MODPOST_WARN=1 -j$(nproc) 2>&1 | tee build.log
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          ls -l *.ko
+          for f in *.ko; do
+            echo "=== $f ==="
+            file "$f"
+            strings -a "$f" | grep -i '^vermagic=' || true
+            aarch64-linux-gnu-objdump -f "$f" | grep -E 'architecture|format' || true
+          done
+
+      - name: 上传 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dvb-usb-smit-an7581-k${{ env.KVER }}
+          path: |
+            *.ko
+            build.log
+          if-no-files-found: error

@@ -72,43 +72,6 @@ jobs:
         run: |
           KERNEL_DIR=$HOME/kernel/linux-${KVER} NO_RC=1 bash ./scripts/prepare-src.sh
 
-      - name: 诊断：给 dvb-core 打 printk（TEMP）
-        run: |
-          python3 - <<'PYEOF'
-          import pathlib, sys
-
-          def after(s, anchor, text):
-              i = s.find(anchor)
-              if i < 0:
-                  print("MISS:", anchor, file=sys.stderr); sys.exit(1)
-              j = i + len(anchor)
-              return s[:j] + text + s[j:]
-
-          def before(s, anchor, text):
-              i = s.find(anchor)
-              if i < 0:
-                  print("MISS:", anchor, file=sys.stderr); sys.exit(1)
-              return s[:i] + text + s[i:]
-
-          p = pathlib.Path("kern/dvb-core/dvbdev.c")
-          s = p.read_text()
-          s = after(s, "unsigned int minor = iminor(inode);",
-                    "\n\tpr_info(\"dvbdiag: inode=%px finode=%px mode=%#x ino=%lu rdev=%#x sizeof=%zu off=%zu\\n\",\n\t\tinode, file->f_inode, (unsigned int)inode->i_mode, inode->i_ino,\n\t\t(unsigned int)inode->i_rdev, sizeof(struct inode),\n\t\toffsetof(struct inode, i_rdev));")
-          s = after(s, "dvbdev = dvb_minors[minor];",
-                    "\n\tpr_info(\"dvbdiag: minor=%u dvbdev=%px fops=%px\\n\",\n\t\tminor, dvbdev, dvbdev ? dvbdev->fops : NULL);")
-          s = after(s, "new_fops = fops_get(dvbdev->fops);",
-                    "\n\t\tpr_info(\"dvbdiag: fops_get=%s owner=%px\\n\",\n\t\t\tnew_fops ? \"ok\" : \"FAIL\", dvbdev->fops->owner);")
-          p.write_text(s)
-
-          f = pathlib.Path("kern/dvb-core/dvb_frontend.c")
-          t = f.read_text()
-          t = before(t, "if (fe->exit == DVB_FE_DEVICE_REMOVED)",
-                     "pr_info(\"dvbdiag: fe_open fe=%px exit=%d\\n\", fe, fe->exit);\n\t")
-          f.write_text(t)
-          print("dvb-core patched ok")
-          PYEOF
-          grep -n "dvbdiag" kern/dvb-core/dvbdev.c kern/dvb-core/dvb_frontend.c
-
       - name: 编译模块
         run: |
           set -o pipefail   # 否则 tee 会吞掉 make 的失败码
@@ -152,6 +115,13 @@ jobs:
           echo "===== struct inode 关键偏移（设备要求 i_rdev = 68）====="
           pahole -C inode dvb-core.ko 2>/dev/null \
             | grep -E 'i_mapping|i_ino|i_nlink|i_rdev|i_size' || true
+          off=$(pahole -C inode dvb-core.ko 2>/dev/null \
+                | sed -n 's/.*i_rdev;[^/]*\/\* *\([0-9]*\).*/\1/p' | head -1)
+          echo "   i_rdev offset = ${off:-?}"
+          if [ "$off" != "68" ]; then
+            echo "!! struct inode 布局与设备不一致（设备 i_rdev @68，CONFIG_FS_POSIX_ACL=y）"
+            exit 1
+          fi
 
       - name: 校验产物
         run: |

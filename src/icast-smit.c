@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -91,23 +92,36 @@ static struct dvb_usb_device_properties icast_properties = {
  * 所以：
  *   - 卸载时（smit_disconnect）就复位，把设备留成"刚插上"的状态，
  *     这样下一次 insmod 的第一次 probe 就是干净的；
- *   - probe 里一旦唤醒无应答立刻复位返回，不再白跑一遍 smit_init（约 12s）；
- *   - 端点被 stall（-EPIPE）才 clear_halt 重试。
+ *   - probe 里在 6s 预算内重试唤醒包（开机时芯片固件比 USB 枚举慢），
+ *     全部超时才复位返回，不再白跑一遍 smit_init（约 12s）；
+ *   - 只有 -EPIPE / -ETIMEDOUT 值得重试。
  */
-#define SMIT_WAKE_ATTEMPTS	3
+/* 唤醒总预算：开机时设备和固件的启动速度不一样 —— USB 枚举很快，
+ * 而芯片从 SPI flash 载入固件要 1~3s。probe 在枚举完成的瞬间就跑了，
+ * 这时发 "FE 00 10 00" 没人应答（-ETIMEDOUT），老代码直接判死并复位，
+ * 白白多绕一次 7s 的重新枚举。
+ * 所以这里给一个总时间预算内反复试；只有明确不是"还没准备好"
+ * 的错误（-ENODEV/-ESHUTDOWN/...）才立刻放弃。 */
+#define SMIT_WAKE_BUDGET_MS	6000
+#define SMIT_WAKE_TIMEOUT_MS	500
 #define SMIT_WAKE_BUF_SIZE	512
 
 static int smit_wake(struct usb_device *udev)
 {
 	const u8 wake[4] = { 0xFE, 0x00, 0x10, 0x00 };
-	int size, ret = 0, attempt;
+	unsigned long t0 = jiffies, deadline;
+	int size, ret = 0, attempt = 0;
 	u8 *buf;
 
 	buf = kmalloc(SMIT_WAKE_BUF_SIZE, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
-	for (attempt = 1; attempt <= SMIT_WAKE_ATTEMPTS; attempt++) {
+	deadline = t0 + msecs_to_jiffies(SMIT_WAKE_BUDGET_MS);
+
+	for (;;) {
+		attempt++;
+
 		/* 清掉可能残留的 stall，同时把 data toggle 复位 */
 		usb_clear_halt(udev,
 			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND));
@@ -117,28 +131,39 @@ static int smit_wake(struct usb_device *udev)
 		memcpy(buf, wake, sizeof(wake));
 		ret = usb_bulk_msg(udev,
 			usb_sndbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_SEND),
-			buf, sizeof(wake), &size, 500);
-		if (ret)
-			goto out;
-
-		ret = usb_bulk_msg(udev,
-			usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
-			buf, SMIT_WAKE_BUF_SIZE, &size, 500);
-		/* 回包长度不确定：设备给的数据比缓冲区多只会报 EOVERFLOW，
-		 * 这时包其实已经收到了，不算失败 */
-		if (ret == -EOVERFLOW)
-			ret = 0;
+			buf, sizeof(wake), &size, SMIT_WAKE_TIMEOUT_MS);
 		if (!ret) {
+			ret = usb_bulk_msg(udev,
+				usb_rcvbulkpipe(udev, SMIT_BULK_ENDPOINT_CMD_RECEIVE),
+				buf, SMIT_WAKE_BUF_SIZE, &size,
+				SMIT_WAKE_TIMEOUT_MS);
+			/* 回包长度不确定：设备给的数据比缓冲区多只会报
+			 * EOVERFLOW，这时包其实已经收到了，不算失败 */
+			if (ret == -EOVERFLOW)
+				ret = 0;
+		}
+
+		if (!ret) {
+			dev_info(&udev->dev,
+				 "wake answered after %d attempt(s), %u ms\n",
+				 attempt, jiffies_to_msecs(jiffies - t0));
 			kfree(buf);
 			return 0;
 		}
-		/* 只有 stall 才值得重试；超时是"固件不应答"，再试也一样 */
-		if (ret != -EPIPE)
+
+		/* 端点 stall 或超时都可能是"还没准备好"；
+		 * 其它错误（设备没了/被关掉了）重试没有意义 */
+		if (ret != -EPIPE && ret != -ETIMEDOUT)
 			break;
-		msleep(50 * attempt);
+		if (time_after_eq(jiffies, deadline))
+			break;
+
+		msleep(200);
 	}
 
-out:
+	dev_info(&udev->dev,
+		 "wake gave up after %d attempt(s) / %u ms, last error %d\n",
+		 attempt, jiffies_to_msecs(jiffies - t0), ret);
 	kfree(buf);
 	return ret;
 }

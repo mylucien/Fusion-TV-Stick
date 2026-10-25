@@ -230,6 +230,7 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   	0x47, 0x53, 0x54, 0x41
   };
   u8 buf[900];
+  int ok;
 
   /* 先把状态明确置 0。原来这条失败分支直接 return 0 而没写 *status，
    * 上层拿到的是 dvb_frontend_ioctl 栈上的未初始化变量：里面可能刚好带着
@@ -244,15 +245,13 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
     return 0;
   }
 
-  if ( smit_tuner_stat(priv->dev->udev, buf, 5) != 32 )
-  {
-    /* 读失败时锁状态是未知的，按"没锁"上报。
-     * 不这么做的话 priv->lock 会停在上一次的值，read_signal_strength /
-     * read_snr 会继续返回旧的强度和信噪比，看起来像是信号还在。 */
-    priv->lock = 0;
-    return 0;
-  }
-  priv->lock = (u8)buf[29];
+  /* 读回的长度不是 32 就认为这次读取失败，锁状态是未知的，按"没锁"上报。
+   * 不这么做的话 priv->lock 会停在上一次的值，read_signal_strength /
+   * read_snr 会继续返回旧的强度和信噪比，看起来像是信号还在。
+   * （这里不再提前 return：让下面的假锁钩子对所有情况都成立，测失锁
+   * 恢复时设备本来就没信号，不能因为读回长度不同就把钩子跳过。） */
+  ok = (smit_tuner_stat(priv->dev->udev, buf, 5) == 32);
+  priv->lock = ok ? (u8)buf[29] : 0;
   if (smit_fake_lock)
     priv->lock = smit_fake_lock > 0 ? 1 : 0;
 
@@ -275,9 +274,10 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
      * swzigzag 重调谐的基准从 474 MHz 变成 474 kHz，失锁之后永远
      * 调不回来。这个字段只保留一个单位（Hz）、一个写入方
      * （set_frontend），设备回报值不再参与。 */
-    priv->snr = (u8)buf[30];
-    priv->strength = (u8)buf[31];
-//    printk("buf[30]=%02X buf[31]=%02X", buf[30], buf[31]);
+    if (ok) {
+      priv->snr = (u8)buf[30];
+      priv->strength = (u8)buf[31];
+    }
   }
   return 0;
 }

@@ -93,7 +93,7 @@ jobs:
           p = pathlib.Path("kern/dvb-core/dvbdev.c")
           s = p.read_text()
           s = after(s, "unsigned int minor = iminor(inode);",
-                    "\n\tpr_info(\"dvbdiag: enter minor=%u\\n\", minor);")
+                    "\n\tpr_info(\"dvbdiag: inode=%px finode=%px mode=%#x ino=%lu rdev=%#x sizeof=%zu off=%zu\\n\",\n\t\tinode, file->f_inode, (unsigned int)inode->i_mode, inode->i_ino,\n\t\t(unsigned int)inode->i_rdev, sizeof(struct inode),\n\t\toffsetof(struct inode, i_rdev));")
           s = after(s, "dvbdev = dvb_minors[minor];",
                     "\n\tpr_info(\"dvbdiag: minor=%u dvbdev=%px fops=%px\\n\",\n\t\tminor, dvbdev, dvbdev ? dvbdev->fops : NULL);")
           s = after(s, "new_fops = fops_get(dvbdev->fops);",
@@ -145,7 +145,7 @@ jobs:
         run: |
           if [ ! -f dvb-core.ko ]; then echo "no ko"; exit 0; fi
           sudo apt-get install -y -qq dwarves >/dev/null 2>&1 || true
-          for t in module mod_kallsyms module_memory mod_arch_specific module_kobject; do
+          for t in module mod_kallsyms module_memory mod_arch_specific module_kobject inode; do
             echo "===== struct $t ====="
             pahole -C "$t" dvb-core.ko 2>&1 | head -80 || true
           done

@@ -91,7 +91,7 @@ jobs:
                    DEBUG_INFO_BTF_MODULES PRINTK_INDEX GENERIC_BUG SMP SYSFS \
                    MODULE_SIG MODULE_UNLOAD STACKTRACE_BUILD_ID HAVE_STATIC_CALL_INLINE \
                    ARCH_USES_CFI_TRAPS; do
-            v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1)
+            v=$(grep -E "^(CONFIG_${k}=|# CONFIG_${k} is not set)" "$K" | head -1 || true)
             printf "   %-26s %s\n" "$k" "${v:-<absent>}"
           done
           echo "===== .gnu.linkonce.this_module 段大小（设备要求 704）====="
@@ -111,6 +111,7 @@ jobs:
           done
 
       - name: 上传 artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dvb-usb-smit-an7581-k${{ env.KVER }}

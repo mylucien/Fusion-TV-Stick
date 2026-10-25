@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/moduleparam.h>
+#include <linux/usb.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
 #include <dvb_frontend.h>
@@ -44,17 +45,21 @@ static struct icast_fe_config icast_config = {
  * skip_wake     : probe 时跳过状态判定，直接跑初始化序列
  *                 （用来复现"热芯片重跑 init 会把自己打死"）
  * reset_on_exit : 卸载时做硬件复位，强制下一次 probe 走冷启动路径
+ * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
  */
 bool smit_trace;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
+static bool smit_diag_probe;
 
 module_param_named(trace, smit_trace, bool, 0644);
 MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
 module_param_named(skip_wake, smit_skip_wake, bool, 0644);
-MODULE_PARM_DESC(skip_wake, "skip the state probe and always run the init sequence");
+MODULE_PARM_DESC(skip_wake, "skip the wake-up and run the init sequence directly");
 module_param_named(reset_on_exit, smit_reset_on_exit, bool, 0644);
 MODULE_PARM_DESC(reset_on_exit, "hardware-reset the chip on disconnect (forces a cold next probe)");
+module_param_named(diag_probe, smit_diag_probe, bool, 0644);
+MODULE_PARM_DESC(diag_probe, "dump descriptors and vendor control replies during probe");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -180,56 +185,80 @@ static int smit_wake(struct usb_device *udev)
 	return ret;
 }
 
-/* ---- 芯片状态判定（两个遗留问题的共同解）----------------------------
+/* ---- 芯片状态判定 ----------------------------------------------------
  *
- * 实测结论（2026-10-25，真机对照实验）：
+ * 目标：热芯片（已经初始化过一次）不要走"复位 -> 重新枚举 7s -> 再 init"。
  *
- *   热芯片发唤醒包 FE 00 10 00        -> 无应答，且之后所有命令全超时
- *   热芯片重跑初始化序列              -> cmd0/cmd3 都应答，但 cmd4（写寄存器
- *                                        0x9F/0x80/0x10）之后固件彻底不回话
- *   热芯片只发一条命令（不唤醒不 init）-> 立即正常应答（0ms，返回数据）
+ * 踩过的坑：用 bulk OUT 发一条命令当探针是**不可行**的 —— 冷芯片收不到应答
+ * 没关系，但那几个字节已经躺进设备的 OUT FIFO 了，紧跟着发的唤醒包
+ * FE 00 10 00 会被拼成一条畸形命令，握手必然失败；probe 失败又触发复位，
+ * 复位后重新枚举、再次探测、再次污染…… 实测会无限循环。
  *
- * 也就是说芯片初始化过一次之后，命令通道一直是活的；把它打死的恰恰是
- * 我们自己的"重新初始化"。原方案（复位 -> 重新枚举 7s -> 再 init 7s）
- * 既慢又完全没必要，只是没人试过"直接问一句"。
- *
- * 因此 probe 分两条路：
- *   探测有应答 -> 芯片在应用模式，跳过唤醒和初始化，直接注册前端（约 0ms）
- *   探测无应答 -> 冷芯片，走唤醒 + 完整初始化（插拔 dongle、整机断电后）
+ * 所以探针必须是非侵入的：只能用 control 请求，或者直接看枚举时就已读到的
+ * 设备描述符。冷芯片（固件还在 bootloader 里）和应用固件很可能报不同的
+ * bcdDevice / 字符串描述符，那样判定就是零开销的。
+ * diag_probe=1 时会把描述符和几个 vendor 请求的应答打出来，冷热各采一次
+ * 就能确定该用哪个字段。
  */
+static void smit_diag(struct usb_device *udev)
+{
+	const struct usb_device_descriptor *d = &udev->descriptor;
+	static const struct { u8 type; u8 req; u16 val; u16 idx; u16 len; } t[] = {
+		{ 0xC0, 0xA0, 0x0000, 0, 64 },
+		{ 0xC0, 0x01, 0x0000, 0, 8  },
+		{ 0xC0, 0x81, 0x0000, 0, 64 },
+		{ 0xC0, 0x82, 0x0000, 0, 64 },
+		{ 0xC0, 0xFF, 0x0000, 0, 64 },
+	};
+	u8 buf[64];
+	int i, ret;
+
+	dev_info(&udev->dev,
+		 "diag: bcdUSB=%04x bcdDevice=%04x id=%04x:%04x cfg=%u cls=%02x/%02x/%02x iMan=%u iProd=%u iSer=%u speed=%d\n",
+		 d->bcdUSB, d->bcdDevice, d->idVendor, d->idProduct,
+		 d->bNumConfigurations, d->bDeviceClass, d->bDeviceSubClass,
+		 d->bDeviceProtocol, d->iManufacturer, d->iProduct,
+		 d->iSerialNumber, udev->speed);
+
+	for (i = 0; i < ARRAY_SIZE(t); i++) {
+		int n = 0;
+
+		memset(buf, 0, sizeof(buf));
+		ret = usb_control_msg(udev,
+			usb_rcvctrlpipe(udev, 0), t[i].req, t[i].type,
+			t[i].val, t[i].idx, buf, t[i].len, 300);
+		if (ret > 0)
+			n = min(ret, 16);
+		dev_info(&udev->dev, "diag: ctrl req=%02x val=%04x -> %d %*ph\n",
+			 t[i].req, t[i].val, ret, n, buf);
+	}
+
+	if (d->iProduct) {
+		ret = usb_string(udev, d->iProduct, buf, sizeof(buf) - 1);
+		if (ret > 0) {
+			buf[ret] = 0;
+			dev_info(&udev->dev, "diag: iProduct=\"%s\"\n", buf);
+		} else {
+			dev_info(&udev->dev, "diag: usb_string(iProduct) -> %d\n", ret);
+		}
+	}
+}
+
 static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
-	u8 cmd0[1] = { 0x01 };
 	int ret;
 
-	if (smit_skip_wake) {
-		/* 实验路径：先打一发纯命令探测，看热芯片的命令通道还通不通。
-		 * 0x81 就是前端 read_status 用的那条命令，芯片若在应用模式应当应答。 */
-		u8 pbuf[900];
+	if (smit_diag_probe)
+		smit_diag(udev);
 
-		ret = smit_tuner_stat(udev, pbuf, 0);
-		dev_info(&udev->dev,
-			 "skip_wake: raw tuner_stat probe -> %d (buf[0]=%02x buf[1]=%02x)\n",
-			 ret, pbuf[0], pbuf[1]);
+	if (smit_skip_wake)
 		goto do_init;
-	}
 
-	/* 初始化序列的第一条命令本来就是 req 0x82 的只读查询，拿它当探针：
-	 * 有应答（0 或协议级错误码）说明芯片在应用模式，USB 层错误码说明是冷芯片。 */
-	ret = smit_set(udev, 0x82, cmd0, 1, 0);
-	if (!smit_is_transport_err(ret)) {
-		dev_info(&udev->dev,
-			 "chip is already initialized (probe reply %d), skipping wake + init\n",
-			 ret);
-		goto register_device;
-	}
-
-	dev_info(&udev->dev, "cold chip (probe %d), waking it up\n", ret);
 	ret = smit_wake(udev);
 	if (ret) {
-		/* 唤醒包也没人理：说明芯片卡在既不在应用模式、又听不懂唤醒的
-		 * 中间态。只有硬件复位能救，代价是重新枚举 6~7 秒。 */
+		/* 唤醒包也不理：芯片卡在既不在应用模式、又听不懂唤醒的中间态，
+		 * 或者干脆是热芯片（唤醒包对它就是毒药）。只有硬件复位能救。 */
 		dev_info(&udev->dev,
 			 "device not responding (%d), resetting to re-enumerate\n",
 			 ret);
@@ -251,7 +280,6 @@ do_init:
 		 * 这里只记录，免得把本来能用的设备判死 */
 		dev_info(&udev->dev, "init sequence reported %d, continuing\n", ret);
 
-register_device:
 	ret = dvb_usb_device_init(intf, &icast_properties, THIS_MODULE, NULL,
 				  adapter_nr);
 	if (ret == 0)

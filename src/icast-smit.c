@@ -200,11 +200,15 @@ static int smit_wake(struct usb_device *udev)
 		 * 芯片连 control 都不应答时每轮固定烧 10s，1s 的预算形同废纸
 		 * （实测死透的芯片能把这里拖到几十秒）。超时的时候端点并没有
 		 * halt，清它纯属自找 5s。现在也只清真正出错的那个端点。 */
-		if (ret == -EPIPE)
-			usb_clear_halt(udev, pipe);
-
+		/* 预算用完就直接放弃。这个判断必须在 clear_halt **之前**：
+		 * 否则最后一轮 EPIPE 会先白烧一次 CLEAR_FEATURE（芯片不应答
+		 * 控制请求时 5s），然后才发现预算早就没了。smit.c 里同类问题
+		 * 已经修过，这里之前漏了。 */
 		if (time_after_eq(jiffies, deadline))
 			break;
+
+		if (ret == -EPIPE)
+			usb_clear_halt(udev, pipe);
 
 		msleep(100);
 	}

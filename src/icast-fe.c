@@ -8,6 +8,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
 #include <linux/version.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
@@ -33,6 +34,21 @@ struct icast_state {
   u8 strength;
   u16 snr;
 };
+
+/* 测试钩子：强制 read_status 上报的锁状态。
+ *
+ * 用来在没有信号源（或者没法远程拔天线）的情况下走完
+ * "锁定 -> 失锁 -> 自己重新锁定" 这条链路：
+ *    0   正常，完全不改变行为（默认）
+ *   >0   无条件上报"已锁定"
+ *   <0   无条件上报"未锁定"
+ *
+ * 它只改最后填进 *status 的结论，命令通道和 buf 解析照旧，所以测的是
+ * 内核状态机 + 驱动的重调谐路径（这正是"失锁后频率被污染"出事的地方），
+ * 不是驱动自身的收发逻辑。和 fault_test 一样，只为验证而存在。 */
+static int smit_fake_lock;
+module_param_named(fake_lock, smit_fake_lock, int, 0644);
+MODULE_PARM_DESC(fake_lock, "test hook: >0 force lock, <0 force unlock, 0 off");
 
 static int icast_fe_init(struct dvb_frontend *fe)
 {
@@ -107,6 +123,7 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   u8 buf[900];
   u32 frequency, symbol_rate;
   struct icast_state *priv = fe->demodulator_priv;
+  unsigned long t0 = jiffies;
   int ret;
 
 	frequency = (u32)(fe->dtv_property_cache.frequency / 1000);
@@ -147,10 +164,30 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
 
   /* 失败必须往上报，而且不能更新 priv：原来把返回值丢掉、永远 return 0，
    * 链路已经死了应用也会看到"调谐成功"，还会把 priv 里的状态改成
-   * "已调到这个频点"——之后 get_frontend 就会把这个假状态报给上层。 */
+   * "已调到这个频点"——之后 get_frontend 就会把这个假状态报给上层。
+   *
+   * 但"哪些失败值得上报"要分清，因为返回负值在核心里是很重的惩罚：
+   * dvb_frontend_swzigzag_autotune() 见到 set_frontend < 0 就把状态置成
+   * FESTATE_ERROR，而 FESTATE_ERROR 之后：
+   *   - swzigzag 的所有分支都不再匹配 -> 再也不会自动重新调谐；
+   *   - FE_READ_STATUS ioctl 直接短路返回 0（不调驱动），应用永远看到"没锁"；
+   * 只有应用重新下发调谐才能脱身。所以：
+   *   - 传输层错误（-110/-71/-19…）：链路死了，上报，让状态机停手，
+   *     自愈复位在后台重枚举，重开后重新走 init；
+   *   - -1006：芯片明确回了错误状态（参数不被接受），原地重试没有意义；
+   *   - -(1000+checkcount)：芯片收下了命令，只是没在预算内回完成标志。
+   *     无信号频点、"正在锁"都可能这样（init 阶段调谐到 0 Hz 实测白等
+   *     4390ms 后拿到 -1100 就是这种）。把它当成失败会让一次失锁永久
+   *     卡死，天线插回来也不会自己恢复 —— 所以按"命令已下发、状态未知"
+   *     处理，上报 0 让状态机继续轮询和重调谐。 */
   ret = smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
-  if (ret < 0)
-    return ret;
+  if (ret < 0) {
+    if (smit_is_transport_err(ret) || ret == -1006)
+      return ret;
+    if (smit_trace)
+      pr_info("dvb_usb_smit:  set_frontend %u Hz: no completion flag (%d), "
+              "treat as accepted\n", fe->dtv_property_cache.frequency, ret);
+  }
 
   /* 状态回读失败不算调谐失败：调谐命令已经下去了，这里返回错误只会
    * 让应用以为没调成而反复重试。真正的失败由 set 那一步暴露。 */
@@ -160,6 +197,17 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   priv->symbol_rate = fe->dtv_property_cache.symbol_rate;
   priv->modulation = fe->dtv_property_cache.modulation;
   priv->tuned = 1;
+
+  /* 调谐是排查"失锁后能不能自己恢复"的唯一观测点：重调谐时核心到底
+   * 拿了多少 Hz 去下发，只有这里看得见。频率单位被污染（474 MHz 变成
+   * 474 kHz）在这种日志里一眼就能认出来。 */
+  if (smit_trace)
+    pr_info("dvb_usb_smit:  set_frontend %s %u Hz sr=%u r=%d %ums\n",
+            fe->dtv_property_cache.delivery_system == SYS_DVBC_ANNEX_A ?
+              "DVBC" : "DVBT",
+            fe->dtv_property_cache.frequency,
+            fe->dtv_property_cache.symbol_rate, ret,
+            jiffies_to_msecs(jiffies - t0));
 
   return 0;
 }
@@ -205,8 +253,10 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
     return 0;
   }
   priv->lock = (u8)buf[29];
+  if (smit_fake_lock)
+    priv->lock = smit_fake_lock > 0 ? 1 : 0;
 
-  if ( buf[29] == 0 )
+  if ( priv->lock == 0 )
   {
     *status = 0;
   }

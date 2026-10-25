@@ -338,7 +338,7 @@ static int __smit_set(struct usb_device *udev, u8 req, u8 *data, unsigned int le
 
 static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 {
-  int ret;
+  int ret, dlen, copy;
   int actual_length = 0;
   SMIT_PACK smit = {.tag = 0x01, .byte2 = 0x0, .req = 0x81, .datalen = 0x01, .data[0] = 0x01};
 
@@ -361,16 +361,30 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
     return -1003;
   }
 
-  ret = (u8)smit.datalen;
-  /* datalen 是设备自己报的，不能盲信：SMIT_PACK 在栈上只初始化了
-   * tag/byte2/req/datalen/data[0] 几个字段，其余是垃圾。设备若报 32
-   * 而实际只回了 5 字节，按 datalen 拷贝就是把栈残留当应答交给调用方，
-   * 调用方还会读到 buf[29] 这种偏移。按实际收到的长度收紧。 */
-  if (ret > actual_length)
-    ret = actual_length;
-  memcpy(out, smit.data, ret);
+  dlen = (int)(u8)smit.datalen;
 
-  if ( ( ret >= actual_length || smit.data[ret] != 0x80 || smit.data[ret + 3] != 0x80 ) && checkcount > 0)
+  /* datalen 是设备自己报的，不能盲信：设备若报 32 而实际只回了 8 字节，
+   * 按 datalen 拷贝就是把传感器没写过的字节当应答交给调用方，调用方还会
+   * 读到 buf[29] 这种偏移。按实际收到的长度收紧。
+   *
+   * 收紧要按 actual_length - 4 算，不是 actual_length：IN 包里前面还有
+   * 4 字节包头（tag / byte2 / req / datalen），有效载荷最多
+   * actual_length - 4 字节。原来钳到 actual_length，每次都会多拷最多
+   * 4 个字节 —— 那 4 个字节并不脏（SMIT_PACK 用的是指定初始化器，C 标准
+   * 保证未列出的成员全部清零；smit_usb_bulk_msg 也是整包 memcpy 进
+   * kmalloc 缓冲、DMA 只覆盖收到的部分，再整包拷回），错的是长度算错。 */
+  copy = dlen;
+  if (actual_length > 4) {
+    if (copy > actual_length - 4)
+      copy = actual_length - 4;
+  } else {
+    copy = 0;
+  }
+  memcpy(out, smit.data, copy);
+
+  /* 完成标志的两个 0x80 是紧跟在**设备自报的载荷**后面的，所以定位必须
+   * 用 dlen，不能用钳位后的 copy，否则偏移就整体错了。 */
+  if ( ( dlen >= actual_length || smit.data[dlen] != 0x80 || smit.data[dlen + 3] != 0x80 ) && checkcount > 0)
   {
       int chk = __smit_check(udev, checkcount);
 
@@ -381,7 +395,7 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
         return chk;
   }
 
-  return ret;
+  return copy;
 }
 
 /* 故障注入，只用来验证自愈链路：>0 时每条命令直接返回 -ETIMEDOUT，不碰硬件。
@@ -465,6 +479,7 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 int smit_init(struct usb_device *udev, u8 *dtmb)
 {
   int err = 0;
+  int i;
   int n = 0;		/* cmd14 应答长度，0 表示没读到 */
   unsigned long t_all = jiffies;
   u8 cmd0[1]  = { 0x01 };
@@ -536,10 +551,21 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
    * 双模芯片被判成单模，而 probe 只会打一句"continuing"，毫无提示。
    *
    * 处理办法：先清零，再只认明确读到的内容 —— 读到 "DTMB:N" 才降级成
-   * 单模，读到 "DTMB:Y" 才升成双模，读不到就保持传入的默认值（双模
-   * ops 是单模的超集，判错时代价最小）。 */
-  memset(buf, 0, sizeof(buf));
-  SMIT_DO((n = smit_tuner_stat(udev, buf, 0)));
+   * 单模，读到 "DTMB:Y" 才升成双模，读不到就重试一次（命令通道丢一包
+   * 是有的），仍然读不到才保持传入的默认值（双模 ops 是单模的超集，
+   * 判错时代价最小）。 */
+  for (i = 0; i < 2; i++)
+  {
+    if (i)
+      SMIT_DO(smit_set(udev, 0xA0, cmd14, 20, 100));
+
+    memset(buf, 0, sizeof(buf));
+    SMIT_DO((n = smit_tuner_stat(udev, buf, 0)));
+    if (n > 18 && (strstr((char *)buf + 18, "DTMB:Y") ||
+                   strstr((char *)buf + 18, "DTMB:N")))
+      break;
+    n = 0;
+  }
 
   if (n > 18)
   {
@@ -547,11 +573,6 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
       *dtmb = 0;
     else if (strstr((char *)buf + 18, "DTMB:Y"))
       *dtmb = 1;
-  }
-  else if (smit_trace)
-  {
-    pr_info("dvb_usb_smit:  tuner info unreadable (%d), keeping %s mode\n",
-            n, *dtmb ? "dual" : "single");
   }
 
   if (!*dtmb)
@@ -564,6 +585,18 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
     
     SMIT_DO(smit_set(udev, 0xA0, cmd12, 10, 100));
     SMIT_DO(smit_tuner_stat(udev, buf, 0));
+  }
+  else if (n <= 18)
+  {
+    /* tuner 信息两次都没读到，只能按默认的双模走：双模 ops 是单模的
+     * 超集，注册不会出错。但 cmd10..cmd12 是单模（DVB-C 专用）的初始化，
+     * 双模芯片本来也不发，这里一起跳过。
+     *
+     * 万一这真是块单模芯片、又恰好两次都丢了回包，DVB-C 那边就没做过
+     * 初始化 —— 这是没有单模硬件时消不掉的取舍，所以至少要让它在 dmesg
+     * 里可见。原来这种情况是完全静默的。 */
+    pr_warn("dvb_usb_smit: tuner mode unreadable (%d), assuming dual mode; "
+            "DVB-C-only init was skipped\n", n);
   }
 
   /* 这条 cmd9 本身是"调谐"命令，初始化阶段频点全是 0，发出去芯片既不会

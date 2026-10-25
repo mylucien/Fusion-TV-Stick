@@ -243,9 +243,12 @@ probe
    状态线程（每 100ms 的 `read_status`）也在同一把信号量下（`dvb_frontend.c`），
    而且这把信号量是 per-frontend 而不是 per-fd。**所有前端操作本来就完全串行**，
    同一个 OUT 包被两个调用者交错在结构上就不可能发生。
-   → `smit_cmd_lock` 仍然保留：它唯一真正起作用的是 `probe`/自愈复位路径，
-   那条路径不受 `fepriv->sem` 保护，确实可能和 ioctl 撞上。但别再把它当成
-   "挂死的解药"——**以后再出现挂死，不要因为"已经加了锁"就把并发排除**。
+   → `smit_cmd_lock` 保留，但要说清楚它**基本不保护任何东西**：
+   自愈 worker 走的是 `smit_reset()`（一条 `usb_control_msg`），根本不拿这把锁；
+   `probe`/`smit_init` 期间设备还没注册，不可能有 ioctl 并发进来。
+   也就是说当前没有任何两条路径会真正并发地进命令通道。留着它只是"便宜保险"
+   （万一以后加了不经过 `fepriv->sem` 的调用者），**别再把它当成"挂死的解药"**——
+   以后再出现挂死，不要因为"已经加了锁"就把并发排除。
    当年那个"4 线程同 fd 压 20s，0 错误"的测试，测的其实是核心的 `fepriv->sem`，
    不是这把锁。真正有效的是下面第 2/3/4 条加上自愈复位。
 
@@ -565,11 +568,17 @@ ls /dev/dvb/adapter0/
   `smit_init()` 中途被拔线），`module_init` 的 ping 会超时，走复位重建，不会卡死。
 - `FE_READ_BER` / `FE_READ_UNCORRECTED_BLOCKS` 返回 `ENOTSUPP`，驱动没实现；
   `dvr0` 在未设置 demux 输出前 open 会返回 `ENOTSUP`，设好 PID 过滤后可读。
+- **只支持一个 dongle**。`smit_in_probe` / `smit_resync_pending` / `smit_err_streak` /
+  `smit_warm_devnum` + `smit_warm_busnum` / `smit_recover_udev` / `icast_config.dtmb`
+  全是全局变量，自愈 workqueue 也只排一个。两块同型号芯片同时插上来会互相踩
+  （统计计数是原子的，但"要不要复位"这类判定是共享的）。
+  要支持多设备，得把这些塞进 per-device 的私有结构体，不是加锁能解决的。
+  这是当前明确的取舍，不是遗漏。
 
 ## 调试参数
 
 ```
-insmod dvb-usb-smit.ko trace=1          # 打印 smit_init 每条命令的耗时
+insmod dvb-usb-smit.ko trace=1          # 打印 smit_init 每条命令的耗时 + 每次 set_frontend 的频率/返回值
 insmod dvb-usb-smit.ko diag_probe=1     # 打印描述符 + 5 个 vendor control 请求的应答
 insmod dvb-usb-smit.ko reset_on_exit=1  # 卸载时复位芯片，强制下一次 probe 走冷启动
 insmod dvb-usb-smit.ko skip_wake=1      # 跳过唤醒直接跑初始化（复现"热芯片被 init 打死"）
@@ -585,5 +594,11 @@ cat /sys/module/dvb_usb_smit/parameters/stats
 
 # 故障注入：让接下来 N 条命令直接返回 -ETIMEDOUT，验证自愈链路
 echo 3 > /sys/module/dvb_usb_smit/parameters/fault_test
+
+# 锁状态注入（没有信号源时也能走完 锁定->失锁->重新锁定）：
+#   >0 强制上报已锁定，<0 强制上报未锁定，0 正常
+echo 1  > /sys/module/dvb_usb_smit/parameters/fake_lock
+echo -1 > /sys/module/dvb_usb_smit/parameters/fake_lock
+echo 0  > /sys/module/dvb_usb_smit/parameters/fake_lock
 ```
 

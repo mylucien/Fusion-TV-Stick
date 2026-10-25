@@ -48,12 +48,18 @@ static struct icast_fe_config icast_config = {
  * reset_on_exit : 卸载时做硬件复位，强制下一次 probe 走冷启动路径
  * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
  * autorecover   : 命令通道连续失败时自动复位芯片重新枚举（默认开）
+ * settle_ms     : 唤醒成功后等多久再发第一条命令（让应用固件启动完）
  */
 bool smit_trace;
 bool smit_autorecover = true;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
 static bool smit_diag_probe;
+
+/* 唤醒包应答之后、固件真正能处理业务命令之前的空窗。
+ * 实测撞过一次：wake answered 0ms，紧接着 560ms 内 cmd0 仍超时，
+ * 整套 init 全 -110 并触发自愈复位，然后循环。300ms 是保守值。 */
+static int smit_settle_ms = 300;
 
 module_param_named(trace, smit_trace, bool, 0644);
 MODULE_PARM_DESC(trace, "print per-command timing of the init sequence");
@@ -65,6 +71,8 @@ module_param_named(diag_probe, smit_diag_probe, bool, 0644);
 MODULE_PARM_DESC(diag_probe, "dump descriptors and vendor control replies during probe");
 module_param_named(autorecover, smit_autorecover, bool, 0644);
 MODULE_PARM_DESC(autorecover, "reset the chip to re-enumerate when the command channel dies");
+module_param_named(settle_ms, smit_settle_ms, int, 0644);
+MODULE_PARM_DESC(settle_ms, "wait this long after the wake-up before the first command");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -399,6 +407,15 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 			smit_reset(udev);
 		return ret;
 	}
+
+	/* 唤醒包只是让芯片从 bootloader 跳到应用固件，它回的 ACK 只代表
+	 * "这条唤醒命令收到了"，不代表"固件已经能处理业务命令"。
+	 * 实测撞过这个空窗：wake answered 0ms 之后 560ms 内 cmd0 仍然超时，
+	 * 整套 init 全 -110，然后触发自愈复位、再撞、开始循环。
+	 * 固件启动时间在软复位后尤其不稳，所以这里留一个可调的 settle 间隔。
+	 * 代价只在冷路径上（插拔 / 复位后），热复用完全不受影响。 */
+	if (smit_settle_ms)
+		msleep(smit_settle_ms);
 do_init:
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {

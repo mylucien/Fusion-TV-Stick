@@ -139,14 +139,20 @@ static int smit_bulk_in(struct usb_device *udev, void *data, int len, int *actua
 }
 
 /* 把 IN 管道里残留的包全部读掉，让下一条命令从干净的边界开始。
- * 只在事务之间调用（持有 smit_cmd_lock），不会吃掉在飞的应答。 */
+ * 只在事务之间调用（持有 smit_cmd_lock），不会吃掉在飞的应答。
+ *
+ * 这里**不能**无条件 smit_clear_halt()：usb_clear_halt() 内部是两条
+ * CLEAR_FEATURE 控制请求，超时用的是 USB_CTRL_GET_TIMEOUT（5s），而芯片
+ * 不应答时它一定走满 5s。实测：init 里 cmd3 花 5580ms、cmd4 花 10630ms，
+ * 正好是「1 次 clear_halt + 一次 560ms 的 IN 超时」和「2 次 + 560ms」。
+ * 触发 resync 的原因是**传输超时**，端点并没有 halt，清 halt 纯属自找 5s。
+ * 真 stall(-EPIPE) 的路径在 smit_bulk_in/out 里已经单独处理了。 */
 static void smit_drain_in(struct usb_device *udev)
 {
 	u8 *buf;
 	int i, actual_length, ret;
 
 	smit_resync_pending = false;
-	smit_clear_halt(udev);
 
 	buf = kmalloc(1024, GFP_KERNEL);
 	if (!buf)
@@ -375,16 +381,26 @@ int smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 /* 下面这一串初始化命令的返回值上游一直是静默忽略的，设备回怪数据
  * （-1003/-1004/-1006）也能继续跑。为了让 probe 能区分"设备回了怪数据"
  * 和"USB 传输本身挂了"，这里把第一个负返回值记下来带出去，
- * 但流程照旧全部执行，不提前退出。 */
+ * 但流程照旧全部执行，不提前退出。
+ *
+ * 唯一例外是传输层失败（-110/-71/-19 这种）：芯片已经完全不回话了，
+ * 剩下二十多条命令发出去也是每条白等一次超时（实测每条 560ms，二十条
+ * 就是十几秒），然后 probe 才失败。这种情况下直接跳过剩余命令，
+ * 让 probe 尽快返回去走复位重试。协议级错误（-1xxx）照旧继续跑。 */
 #define SMIT_DO(expr) do {						\
-	int __r;							\
+	int __r = 0;							\
 	unsigned long __t0 = jiffies;					\
-	__r = (expr);							\
-	if (__r < 0 && err == 0)					\
-		err = __r;						\
-	if (smit_trace)							\
-		pr_info("dvb_usb_smit:  %-46s %5ums r=%d\n", #expr,	\
-			jiffies_to_msecs(jiffies - __t0), __r);		\
+	if (!(err < 0 && smit_is_transport_err(err))) {			\
+		__r = (expr);						\
+		if (__r < 0 && err == 0)				\
+			err = __r;					\
+		if (smit_trace)						\
+			pr_info("dvb_usb_smit:  %-46s %5ums r=%d\n", #expr,	\
+				jiffies_to_msecs(jiffies - __t0), __r);	\
+	} else if (smit_trace) {					\
+		pr_info("dvb_usb_smit:  %-46s  skipped (link dead, %d)\n", \
+			#expr, err);					\
+	}								\
 } while (0)
 
 int smit_init(struct usb_device *udev, u8 *dtmb)

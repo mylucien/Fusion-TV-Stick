@@ -219,7 +219,10 @@ do_init:
 	ret = smit_init(udev, &icast_config.dtmb);
 	if (smit_is_transport_err(ret)) {
 		dev_err(&udev->dev, "init failed at USB level: %d\n", ret);
-		smit_reset(udev);
+		/* 实验模式下不要复位：否则同一次 insmod 里会不断
+		 * 复位→重枚举→再失败，变成死循环 */
+		if (!smit_skip_wake)
+			smit_reset(udev);
 		return ret;
 	}
 	if (ret)

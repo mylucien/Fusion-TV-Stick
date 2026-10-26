@@ -400,10 +400,11 @@ static int __smit_tuner_stat(struct usb_device *udev, u8 *out, int checkcount)
 
 /* 故障注入，只用来验证自愈链路：>0 时每条命令直接返回 -ETIMEDOUT，不碰硬件。
  * 设成 3 再调两次 FE_READ_STATUS（每次两条命令）就能凑满连续失败阈值，
- * 观察芯片是否会自动复位重新枚举、节点是否自己回来。默认 0，不影响正常行为。 */
+ * 观察芯片是否会自动复位重新枚举、节点是否自己回来。默认 0，不影响正常行为。
+ * 权限 0600：只有 root 能写，避免普通进程随手把链路"弄坏"。 */
 static int smit_fault_test;
-module_param_named(fault_test, smit_fault_test, int, 0644);
-MODULE_PARM_DESC(fault_test, "inject N transport failures to exercise auto recovery");
+module_param_named(fault_test, smit_fault_test, int, 0600);
+MODULE_PARM_DESC(fault_test, "test hook only: inject N transport failures");
 
 static bool smit_fault_hit(struct usb_device *udev)
 {
@@ -594,9 +595,18 @@ int smit_init(struct usb_device *udev, u8 *dtmb)
      *
      * 万一这真是块单模芯片、又恰好两次都丢了回包，DVB-C 那边就没做过
      * 初始化 —— 这是没有单模硬件时消不掉的取舍，所以至少要让它在 dmesg
-     * 里可见。原来这种情况是完全静默的。 */
-    pr_warn("dvb_usb_smit: tuner mode unreadable (%d), assuming dual mode; "
-            "DVB-C-only init was skipped\n", n);
+     * 里可见。
+     *
+     * 但要分清两种"读不到"：链路在此之前就断了（传输层错误），
+     * SMIT_DO 后面全是 skipped，n 自然是 0，这跟"读到了但认不出"是两回事。
+     * 前者已经由 probe 统一处理（会去复位），这里再 warn 一次只会把
+     * 排查方向带偏。 */
+    if (err < 0 && smit_is_transport_err(err))
+      pr_info("dvb_usb_smit: link failed (%d) before tuner info, "
+              "keeping dual mode\n", err);
+    else
+      pr_warn("dvb_usb_smit: tuner mode unreadable (%d), assuming dual mode; "
+              "DVB-C-only init was skipped\n", n);
   }
 
   /* 这条 cmd9 本身是"调谐"命令，初始化阶段频点全是 0，发出去芯片既不会

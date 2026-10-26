@@ -45,10 +45,11 @@ struct icast_state {
  *
  * 它只改最后填进 *status 的结论，命令通道和 buf 解析照旧，所以测的是
  * 内核状态机 + 驱动的重调谐路径（这正是"失锁后频率被污染"出事的地方），
- * 不是驱动自身的收发逻辑。和 fault_test 一样，只为验证而存在。 */
+ * 不是驱动自身的收发逻辑。和 fault_test 一样，只为验证而存在：
+ * 权限 0600，只有 root 能改，默认 0 时行为与未加钩子完全一致。 */
 static int smit_fake_lock;
-module_param_named(fake_lock, smit_fake_lock, int, 0644);
-MODULE_PARM_DESC(fake_lock, "test hook: >0 force lock, <0 force unlock, 0 off");
+module_param_named(fake_lock, smit_fake_lock, int, 0600);
+MODULE_PARM_DESC(fake_lock, "test hook only: >0 force lock, <0 force unlock, 0 off");
 
 static int icast_fe_init(struct dvb_frontend *fe)
 {
@@ -163,8 +164,12 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
   }
 
   /* 失败必须往上报，而且不能更新 priv：原来把返回值丢掉、永远 return 0，
-   * 链路已经死了应用也会看到"调谐成功"，还会把 priv 里的状态改成
-   * "已调到这个频点"——之后 get_frontend 就会把这个假状态报给上层。
+   * priv 里的状态会被改成"已调到这个频点"，之后 get_frontend 就会把这个
+   * 假状态报给上层。
+   *
+   * 注意这里说的是 priv 被写脏，不是"应用会看到调谐成功" —— 应用本来就
+   * 拿不到这个返回值：DTV_TUNE 只是把 fepriv->state 置成 FESTATE_RETUNE
+   * 就返回 0，真正的 set_frontend 是状态线程后来调的。
    *
    * 但"哪些失败值得上报"要分清，因为返回负值在核心里是很重的惩罚：
    * dvb_frontend_swzigzag_autotune() 见到 set_frontend < 0 就把状态置成
@@ -181,6 +186,29 @@ static int icast_fe_set_frontend(struct dvb_frontend *fe)
    *     卡死，天线插回来也不会自己恢复 —— 所以按"命令已下发、状态未知"
    *     处理，上报 0 让状态机继续轮询和重调谐。 */
   ret = smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
+
+  /* 传输层错误先自己重发一次，别急着把状态机推到 ERROR。
+   *
+   * 命令通道偶发丢一包是常态（smit_init 那边就记过"丢一包是有的"）。
+   * 一次孤立的 -ETIMEDOUT 如果直接上抛，核心会进 FESTATE_ERROR 再也不
+   * 重调谐；而紧接着线程里的 read_status 是成功的，err_streak 反而被清零，
+   * 自愈也不会启动 —— 结果链路明明是好的，前端却永久停在"没锁"，
+   * 只能等应用重新下发调谐。这正好是"画面不动、但不拔插也能好"的反面。
+   *
+   * 重发是安全的：smit_bulk_transfer() 在超时时已经把 smit_resync_pending
+   * 置上了，下一次事务开头的 smit_prepare() 会先把 IN 管道里可能残留的
+   * 半包/迟到应答抽干净，再从干净的边界重新发。
+   *
+   * 设备已经不在（-ENODEV / -ESHUTDOWN）不重发：那是热插拔事件，
+   * 交给上层和自愈处理，多打一次只会白等。 */
+  if (ret < 0 && smit_is_transport_err(ret) &&
+      ret != -ENODEV && ret != -ESHUTDOWN) {
+    if (smit_trace)
+      pr_info("dvb_usb_smit:  set_frontend %u Hz: transport error %d, "
+              "resending once\n", fe->dtv_property_cache.frequency, ret);
+    ret = smit_set(priv->dev->udev, 0xA0u, cmd9, 32, 100);
+  }
+
   if (ret < 0) {
     if (smit_is_transport_err(ret) || ret == -1006)
       return ret;
@@ -230,7 +258,7 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
   	0x47, 0x53, 0x54, 0x41
   };
   u8 buf[900];
-  int ok;
+  int ok = 0;
 
   /* 先把状态明确置 0。原来这条失败分支直接 return 0 而没写 *status，
    * 上层拿到的是 dvb_frontend_ioctl 栈上的未初始化变量：里面可能刚好带着
@@ -238,19 +266,20 @@ static int icast_fe_read_status(struct dvb_frontend *fe, enum fe_status *status)
    * 画面对着不动的画面永远不恢复，看起来就像驱动挂了。 */
   *status = 0;
 
-  /* 命令发出失败就直接按"没锁"返回，没必要再等一次 tuner_stat 的
-   * 超时预算（芯片不应答时那是 560ms 起，最坏几秒）。 */
-  if (smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50) < 0) {
-    priv->lock = 0;
-    return 0;
-  }
+  /* 命令发出失败就直接按"没锁"处理，没必要再等一次 tuner_stat 的
+   * 超时预算（芯片不应答时那是 560ms 起，最坏几秒）。
+   * 但**不能提前 return**：fake_lock 钩子必须对所有分支都成立，否则
+   * 换一种固件行为（比如无信号时 cmd12 完不成）钩子就静默失效，
+   * 测出来的"恢复正常"是假的。 */
+  if (smit_set(priv->dev->udev, 0xA0u, cmd12, 20, 50) < 0)
+    ok = 0;
+  else
+    ok = (smit_tuner_stat(priv->dev->udev, buf, 5) == 32);
 
-  /* 读回的长度不是 32 就认为这次读取失败，锁状态是未知的，按"没锁"上报。
-   * 不这么做的话 priv->lock 会停在上一次的值，read_signal_strength /
-   * read_snr 会继续返回旧的强度和信噪比，看起来像是信号还在。
-   * （这里不再提前 return：让下面的假锁钩子对所有情况都成立，测失锁
-   * 恢复时设备本来就没信号，不能因为读回长度不同就把钩子跳过。） */
-  ok = (smit_tuner_stat(priv->dev->udev, buf, 5) == 32);
+  /* 读回的长度不是 32（或者命令就没发出去）就认为这次读取失败，锁状态
+   * 未知，按"没锁"上报。不这么做的话 priv->lock 会停在上一次的值，
+   * read_signal_strength / read_snr 会继续返回旧的强度和信噪比，
+   * 看起来像是信号还在。 */
   priv->lock = ok ? (u8)buf[29] : 0;
   if (smit_fake_lock)
     priv->lock = smit_fake_lock > 0 ? 1 : 0;

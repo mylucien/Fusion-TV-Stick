@@ -36,6 +36,10 @@
 | 第三轮：失锁 → 自己恢复 | ✅ 0.52s 重新锁定，无需应用重新调谐；重调谐下发始终 `474000000 Hz`，**没有 474000** |
 | 第三轮：`-1100` 回归（A/B 对照） | ✅ 旧 ko 28 次后卡 `FESTATE_ERROR`；新 ko 40/40 正常，见「关键坑 7」 |
 | 第三轮：热 reload / 压测 / 自愈 | ✅ 0.08s / 1462 次 0 错 max 110ms / `recover=1`、10.1s 节点自己回来 |
+| 第四轮：孤立传输超时（A/B） | ✅ 旧 ko 34 个连续 0（卡 `FESTATE_ERROR`）→ 新 ko **0 个**，kmsg 有 `transport error -110, resending once` |
+| 第四轮：`fake_lock` 覆盖 cmd12 失败 | ✅ 旧 ko `status=0x00`（钩子被绕过）→ 新 ko `0x1f` |
+| 第四轮：热 reload / 冷启动 | ✅ 0.08s / 10.41s（`ok=22`，属已知"已枚举完多绕一次 ping"的 10s 档） |
+| 第四轮：失锁→恢复 / 压测 / 自愈 | ✅ 0.52s 重锁、频率始终 Hz / 1100 次 0 错 max 110ms / `recover=1`、10.1s |
 
 设备上实测：
 
@@ -578,6 +582,75 @@ A/B 实测：同一脚本、同一频点，反复调谐 15 次后观察 40 次 `
 > 内容其实是 0，不是栈残留 —— 指定初始化器会把整个 `SMIT_PACK` 清零，
 > `smit_usb_bulk_msg` 也是整包拷进 kmalloc 缓冲再 DMA，所以错的只是长度。
 
+## 关键坑 8：一次孤立的传输超时也能让前端永久停手
+
+「关键坑 7」处理了协议级的 `-1100`，但传输层错误仍然直接上抛。这条路径
+不用并发也能踩到，而且**自愈不会来救**：
+
+```
+set_frontend 撞上一次孤立的 -ETIMEDOUT（命令通道丢一包，smit_init 里就记过）
+  -> 返回负值 -> 核心置 FESTATE_ERROR
+  -> 从此不再重调谐，FE_READ_STATUS 也被短路（*status = 0，不调驱动）
+  -> 而状态线程里的 read_status 每次都成功 -> err_streak 被清零
+  -> 自愈永远不触发
+  -> 结果：链路是好的，前端永久"没锁"，只能等应用重新下发调谐
+```
+
+修法不是"别上报"，而是**先自己重发一次**再决定：
+
+```c
+ret = smit_set(udev, 0xA0, cmd9, 32, 100);
+if (ret < 0 && smit_is_transport_err(ret) &&
+    ret != -ENODEV && ret != -ESHUTDOWN)
+        ret = smit_set(udev, 0xA0, cmd9, 32, 100);   /* 丢一包很常见 */
+```
+
+重发是安全的：超时时 `smit_bulk_transfer()` 已经把 `smit_resync_pending`
+置上，下一次事务开头的 `smit_prepare()` 会先把 IN 管道里可能残留的半包或
+迟到应答抽干，再从干净边界重新发。`-ENODEV` / `-ESHUTDOWN` 不重发 ——
+那是热插拔事件，重发只会白等。
+
+只重发一次（不是循环）：链路真死的时候，每次重发都要付一个 560ms 的超时，
+-EIPE 还要再加一次 5s 的 `CLEAR_FEATURE`；而连续两次失败已经足够说明问题，
+这时让 `err_streak` 涨到 2，下一次 `read_status` 失败就会触发自愈。
+
+### A/B 实测（`fault_test=1` 注入一次传输失败，不需要信号源）
+
+| 版本 | `stats.ok` 增量序列（40 次 `FE_READ_STATUS`） | 判定 |
+|---|---|---|
+| 旧 ko `004e5b7a` | `0 0 0 0 0 1` 然后 34 个 0 | ioctl 被短路 = `FESTATE_ERROR` |
+| 新 ko `a2a0e0ef` | `2 2 3 3 3 2 …`（末尾连续 0 的个数 **0**） | 状态机活着 |
+
+kmsg 直接证据（`trace=1`）：
+
+```
+dvb_usb_smit:  set_frontend 474000000 Hz: transport error -110, resending once
+```
+
+### 顺带修掉的四条小的
+
+- `read_status` 里 `smit_set(cmd12) < 0` 的那条提前 return 绕过了 `fake_lock`
+  钩子，和注释里"钩子对所有情况都成立"矛盾。改成先算 `ok` 再统一走判定，
+  顺带把 `ok` 初始化掉（原来失败分支会读未初始化的判定值）。
+  A/B：`fault_test=1 + fake_lock=1` 读状态，旧 ko `0x00`、新 ko `0x1f`。
+- `set_frontend` 的注释还留着"应用也会看到调谐成功"这句错话（`DTV_TUNE`
+  只置 `FESTATE_RETUNE` 就返回 0，应用根本拿不到这个返回值），删掉。
+- `smit_init` 里"assuming dual mode"的警告在链路已断时也会打，把排查方向
+  带偏。现在区分两种情况：传输层错误打 `link failed (…) before tuner info`，
+  只有"读到了但认不出"才 `pr_warn`。
+- `fake_lock` / `fault_test` 权限从 `0644` 改成 `0600`，参数说明标成
+  `test hook only`：正式固件里普通进程不该能把链路"弄坏"或伪造锁状态。
+
+### `postcheck.sh` 严格化
+
+原来有两处"看着在检查、其实不检查"：
+
+- vermagic 只比后缀 `" SMP mod_unload aarch64"`，**6.18.99 / 6.18.55-rc1
+  编出来的都会判通过**，而实际 `insmod` 会报 `version magic ... should be ...`。
+  改成比全串，可用 `EXPECT_VERMAGIC` 覆盖。
+- `this_module` 大小不符时只打印、不设失败码，等于"警告一下继续装"。
+  现在默认让构建失败（`STRICT=1`），确实要放过用 `STRICT=0`。
+
 ## 目录
 
 ```
@@ -651,6 +724,21 @@ ls /dev/dvb/adapter0/
   （统计计数是原子的，但"要不要复位"这类判定是共享的）。
   要支持多设备，得把这些塞进 per-device 的私有结构体，不是加锁能解决的。
   这是当前明确的取舍，不是遗漏。
+- **没有真实信号验证过的那部分**。手头没有能收 DTMB/DVB-C 的信号源，
+  所以下面这些只在"无信号"和 `fake_lock` 造假锁的条件下跑过，真实码流下
+  没验过：
+  - `read_status` 重构后的三个点：`ok` 判定、`priv->lock = buf[29]`、
+    五个状态位（`SIGNAL/CARRIER/VITERBI/SYNC/LOCK`）。有信号时
+    `FE_READ_STATUS` 应该是 `0x1f`。
+  - 强度/信噪比的 `0..100 -> 0..65535` 换算里那个 **clamp 假设**。依据是
+    原版那串魔数正好是 `x * 65535 / 100` 的定点展开，说明作者认为设备
+    回报 0..100；但没有实测确认 `buf[30]`/`buf[31]` 一定 ≤100。
+    如果实际会超过 100，clamp 会把高值压成满格，而不是像原版那样回绕成小值。
+- **无信号频点上每次调谐固定约 2s**（`set_frontend` 里 `-1100`，实测 2050ms）。
+  这是上游原有行为，不是回归：`smit_set(cmd9, …, 100)` 的完成标志在芯片
+  调不出台时等不到。全频段扫描会因此变慢，而且这段时间一直持有 `fepriv->sem`。
+  想优化可以调小 cmd9 的 `need_complete_flag`，但**要先确认完成标志对后续
+  状态读取没有影响**，没验过之前不动。
 
 ## 调试参数
 
@@ -678,4 +766,8 @@ echo 1  > /sys/module/dvb_usb_smit/parameters/fake_lock
 echo -1 > /sys/module/dvb_usb_smit/parameters/fake_lock
 echo 0  > /sys/module/dvb_usb_smit/parameters/fake_lock
 ```
+
+> `fake_lock` 和 `fault_test` 是**测试钩子**，权限 `0600`（只有 root 能改），
+> 默认值 0 时行为与没有钩子完全一致。正式固件里不建议把它们暴露给普通进程：
+> 前者能伪造锁状态，后者能把链路"弄坏"（真会触发自愈复位）。
 

@@ -133,6 +133,17 @@ make -C $(PKG_BUILD_DIR) KERNEL_DIR=$(LINUX_DIR) ARCH=arm64 \
 `this_module` 大小打出来。**看到 704 才对**，看到别的大小就说明这套树的
 内核配置跟设备不一样。
 
+两条指标**默认都会让构建失败**（`STRICT=1`），因为不满足就是装不上：
+`this_module != 704`、或者 vermagic 与设备内核（`6.18.55 SMP mod_unload aarch64`）
+不完全一致（原来只比后缀，版本号不同也放过）。
+
+确实要临时放过：
+
+```sh
+STRICT=0 sh openwrt/postcheck.sh                      # 只警告
+EXPECT_MODULE_SIZE=0 EXPECT_VERMAGIC= sh openwrt/postcheck.sh   # 不比对
+```
+
 ## 注意事项
 
 1. **不要同时选 OpenWrt 自带的 `kmod-dvb-core`**。两个包各装一个同名

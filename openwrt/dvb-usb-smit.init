@@ -1,0 +1,50 @@
+#!/bin/sh /etc/rc.common
+# dvb-usb-smit: SMIT iCast DTMB/DVB-C USB dongle (29df:0001)
+#
+# 手动装的三个 .ko 放在 /lib/modules/$(uname -r)/，没有走 opkg，
+# 所以没有 /etc/modules.d 里的 AUTOLOAD 条目，开机不会自己加载。
+# 这个脚本补上那一步，加载顺序固定：dvb-core -> dvb-usb -> dvb-usb-smit。
+#
+# 冷芯片从 insmod 到 /dev/dvb/adapter0/frontend0 出现约 10s
+# （芯片固件要重新枚举），这期间节点不存在，播放器要能重试 open。
+
+START=30
+STOP=10
+
+EXTRA_COMMANDS="status"
+EXTRA_HELP="	status	Print module state and whether the frontend node exists"
+
+KODIR=/lib/modules/$(uname -r)
+
+loaded() {
+	lsmod | grep -q "^$1 "
+}
+
+ins() {
+	loaded "$1" && return 0
+	insmod "$KODIR/$2" || {
+		logger -t dvb-usb-smit "insmod $2 failed: $?"
+		return 1
+	}
+}
+
+start() {
+	ins dvb_core dvb-core.ko || return 1
+	ins dvb_usb dvb-usb.ko || return 1
+	ins dvb_usb_smit dvb-usb-smit.ko || return 1
+}
+
+stop() {
+	loaded dvb_usb_smit && rmmod dvb_usb_smit
+	loaded dvb_usb && rmmod dvb_usb
+	loaded dvb_core && rmmod dvb_core
+}
+
+status() {
+	if loaded dvb_usb_smit; then
+		echo "running"
+		[ -e /dev/dvb/adapter0/frontend0 ] || echo "frontend node missing"
+	else
+		echo "stopped"
+	fi
+}

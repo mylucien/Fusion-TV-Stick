@@ -50,6 +50,19 @@ make package/kernel/dvb-usb-smit/compile V=s
 
 只想拿 `.ko` 手动 insmod 也行，编完直接去 `build_dir/target-*/linux-*/dvb-usb-smit/` 取。
 
+手动装的话**没有** `/etc/modules.d` 里的 AUTOLOAD 条目（那是 opkg 装包时生成的），
+开机不会自己加载。用 `openwrt/dvb-usb-smit.init` 补上：
+
+```sh
+# 三个 .ko 放到 /lib/modules/$(uname -r)/
+scp dvb-usb-smit.init root@<ip>:/etc/init.d/dvb-usb-smit
+ssh root@<ip> 'chmod 755 /etc/init.d/dvb-usb-smit; /etc/init.d/dvb-usb-smit enable'
+ssh root@<ip> '/etc/init.d/dvb-usb-smit status'   # running / stopped
+```
+
+它按 `dvb-core -> dvb-usb -> dvb-usb-smit` 顺序 insmod（已加载的跳过），
+`stop` 反序 rmmod，`status` 顺带报前端节点在不在。
+
 ## 怎么把它加进 config
 
 `KernelPackage/dvb-usb-smit` 会被自动加上 `kmod-` 前缀，所以**包名是

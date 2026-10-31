@@ -56,6 +56,12 @@ CONFIG_CLONE_BACKWARDS=y
 CONFIG_COMMON_CLK=y
 CONFIG_COMMON_CLK_EN7523=y
 CONFIG_COMPACT_UNEVICTABLE_DEFAULT=1
+# 设备上跑着 32 位用户态（astra 是 bionic 32 位，走 /usr/lib/astra/ld），
+# 所以目标内核必然是 CONFIG_COMPAT=y。generic delta 里那条
+# "# CONFIG_COMPAT is not set" 是别的 arm64 target 的，照抄过来就会让
+# dvb-core 不提供 compat_ioctl —— 32 位进程的 FE_SET_PROPERTY 直接 ENOTTY，
+# 实测现象：astra 报 "DTV_CLEAR failed [Not a typewriter]" 然后退出。
+CONFIG_COMPAT=y
 # CONFIG_COMPAT_32BIT_TIME is not set
 CONFIG_CONTEXT_TRACKING=y
 CONFIG_CONTEXT_TRACKING_IDLE=y

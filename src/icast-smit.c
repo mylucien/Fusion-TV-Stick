@@ -328,9 +328,14 @@ static char smit_pending_port[SMIT_PORT_LEN];
 static bool smit_pending_ok;
 static struct delayed_work smit_reset_watch;
 
-static const char *smit_port(struct usb_device *udev)
+/* 端口名 = "%d-%s" (busnum, devpath)，和 sysfs / kmsg 里的 "1-1"、"3-1" 一致。
+ * 别直接用 udev->devpath：它只是端口路径（本机两支棒子都是 "1"），
+ * 拿它当键会让不同控制器上同端口的设备撞成同一个键 —— 实测踩过：
+ * pin 表写 1-1 匹配不上 devpath 的 "1"，复位照发。 */
+static void smit_portname(struct usb_device *udev, char *out, size_t len)
 {
-	return udev->devpath ? udev->devpath : "?";
+	snprintf(out, len, "%d-%s", udev->bus->busnum,
+		 udev->devpath ? udev->devpath : "?");
 }
 
 /* 人工钉死的端口表：逗号分隔，允许前后空格 */
@@ -381,9 +386,10 @@ static void smit_verdict_set(const char *port, bool costly)
 /* true = 这支设备上复位代价是分钟级，别再复位它 */
 static bool smit_reset_is_costly(struct usb_device *udev)
 {
-	const char *port = smit_port(udev);
+	char port[SMIT_PORT_LEN];
 	int i;
 
+	smit_portname(udev, port, sizeof(port));
 	if (smit_port_pinned_costly(port))
 		return true;
 	i = smit_verdict_slot(port, false);
@@ -438,18 +444,22 @@ static DECLARE_DELAYED_WORK(smit_reset_watch, smit_reset_watch_fn);
  * 返回 true 表示确实发了复位。 */
 static bool smit_try_reset(struct usb_device *udev, const char *why)
 {
+	char port[SMIT_PORT_LEN];
+
+	smit_portname(udev, port, sizeof(port));
+
 	if (smit_reset_is_costly(udev)) {
 		dev_warn(&udev->dev,
 			 "%s, but a reset on %s is known to cost minutes; leaving it alone\n",
-			 why, smit_port(udev));
+			 why, port);
 		return false;
 	}
 	if (!smit_reset_allowed())
 		return false;
 
-	dev_warn(&udev->dev, "%s, resetting chip\n", why);
+	dev_warn(&udev->dev, "%s, resetting chip (%s)\n", why, port);
 
-	snprintf(smit_pending_port, sizeof(smit_pending_port), "%s", smit_port(udev));
+	snprintf(smit_pending_port, sizeof(smit_pending_port), "%s", port);
 	smit_pending_ok = false;
 	smit_reset(udev);
 	schedule_delayed_work(&smit_reset_watch, msecs_to_jiffies(SMIT_VERDICT_MS));
@@ -596,12 +606,24 @@ static int smit_probe(struct usb_interface *intf, const struct usb_device_id *id
 		goto register_device;
 	}
 
-	ret = smit_wake(udev);
-	if (ret == -EPIPE || ret == -ETIMEDOUT) {
-		/* 半初始化状态下第一次唤醒常常不接，抽干 IN 再给一次机会；
-		 * 两次都不行才算真的需要复位。 */
-		smit_flush_in(udev);
-		ret = smit_wake(udev);
+	/* 冷路径：唤醒包要发几次。
+	 * 实测 USB 重新授权/重新枚举之后，芯片要过一两秒才"听得懂"唤醒包；
+	 * 只发一次的旧逻辑会立刻判死然后复位（复位在贵的批次上是分钟级）。
+	 * 这里给 4 次机会（每次 500ms 超时 + 200ms 间隔，最坏 ~4.5s），
+	 * 每次都先抽干 IN，免得读到上一次的残留。 */
+	{
+		int i;
+
+		for (i = 0; i < 4; i++) {
+			if (i)
+				msleep(200);
+			smit_flush_in(udev);
+			ret = smit_wake(udev);
+			if (!ret || (ret != -EPIPE && ret != -ETIMEDOUT))
+				break;
+			dev_info(&udev->dev, "wake attempt %d failed (%d), retrying\n",
+				 i + 1, ret);
+		}
 	}
 	if (ret) {
 		/* 唤醒包也不理：芯片卡在既不在应用模式、又听不懂唤醒的中间态。
@@ -751,8 +773,11 @@ static int __init smit_module_init(void)
 					msleep(50);
 				}
 			} else {
+				char port[SMIT_PORT_LEN];
+
+				smit_portname(udev, port, sizeof(port));
 				pr_info("dvb_usb_smit: cold chip (ping %d) on %s, not resetting; probe will decide\n",
-					ret, smit_port(udev));
+					ret, port);
 			}
 		}
 		usb_put_dev(udev);

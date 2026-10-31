@@ -49,12 +49,16 @@ static struct icast_fe_config icast_config = {
  * diag_probe    : probe 时打印设备描述符和 vendor control 请求的应答
  * autorecover   : 命令通道连续失败时自动复位芯片重新枚举（默认开）
  * settle_ms     : 唤醒成功后等多久再发第一条命令（让应用固件启动完）
+ * reset_on_cold : 冷芯片（module_init 探活超时）时是否立刻复位。默认关：
+ *                 复位代价实测 6.5s~806s（同一行代码，离散度 100 倍以上），
+ *                 而交给 probe 走 wake+init 只要 ~3s
  */
 bool smit_trace;
 bool smit_autorecover = true;
 static bool smit_skip_wake;
 static bool smit_reset_on_exit;
 static bool smit_diag_probe;
+static bool smit_reset_on_cold;
 
 /* 唤醒包应答之后、固件真正能处理业务命令之前的空窗。
  * 实测撞过一次：wake answered 0ms，紧接着 560ms 内 cmd0 仍超时，
@@ -77,6 +81,8 @@ module_param_named(autorecover, smit_autorecover, bool, 0644);
 MODULE_PARM_DESC(autorecover, "reset the chip to re-enumerate when the command channel dies");
 module_param_named(settle_ms, smit_settle_ms, int, 0644);
 MODULE_PARM_DESC(settle_ms, "wait this long after the wake-up before the first command");
+module_param_named(reset_on_cold, smit_reset_on_cold, bool, 0644);
+MODULE_PARM_DESC(reset_on_cold, "reset the chip when module_init finds it cold (default off: the reset can cost minutes)");
 
 static int icast_frontend_attach(struct dvb_usb_adapter *adap)
 {
@@ -758,11 +764,14 @@ static int __init smit_module_init(void)
 			int i;
 
 			/* 冷芯片：探针可能弄脏了 FIFO，复位一次换来干净的重枚举。
-			 * 但这一步在有的批次上是分钟级（实测 806s），所以先问
-			 * smit_try_reset()：端口被钉死成 reset_costly_ports、或者
-			 * 本次加载已经判定过昂贵，就不复位，直接交给 usb_register
-			 * 之后的 probe（它会先 ping 再决定要不要唤醒）。 */
-			if (smit_try_reset(udev, "cold chip, cleaning the FIFO")) {
+			 * 但这只在 reset_on_cold=1 时才做 —— 复位代价实测 6.5s~806s
+			 * （同一行代码，同一型号，离散度 100 倍以上），而 probe 对
+			 * 冷芯片走 wake(最多 4 次) + init 只要 ~3s，完全不需要复位。
+			 * 真机实测：冷启动（整机断电上电）时本分支复位 1-1，节点从
+			 * 18.0s 被拖到 130.2s 才出现，其中 108s 全花在等重枚举。
+			 * 默认交给 usb_register 之后的 probe（它先 ping 再决定唤醒）。 */
+			if (smit_reset_on_cold &&
+			    smit_try_reset(udev, "cold chip, cleaning the FIFO")) {
 				/* 复位是"发完命令才重启"，实测要 ~0.8s 才真正从
 				 * 总线上消失。如果这时就去 usb_register，probe 会撞上
 				 * 一个正在重启的设备（-ENODEV），再触发一次复位。
@@ -776,7 +785,7 @@ static int __init smit_module_init(void)
 				char port[SMIT_PORT_LEN];
 
 				smit_portname(udev, port, sizeof(port));
-				pr_info("dvb_usb_smit: cold chip (ping %d) on %s, not resetting; probe will decide\n",
+				pr_info("dvb_usb_smit: cold chip (ping %d) on %s, will let probe wake it\n",
 					ret, port);
 			}
 		}

@@ -363,6 +363,16 @@ ok=2932 timeout=0 epipe=0 resync=0 recover=1 err_streak=0
 日志里出现 `marking it reset-costly on 1-1` 时，把 `1-1` 写进 init 脚本的
 `reset_costly_ports`，下次开机就不用再赌一次。
 
+**带空格要套引号，而且引号要传到内核**：`parse_args()` 是按空格切分的，
+shell 引号只保住 argv，保不住内核那一步。写成
+`reset_costly_ports=1-1 ,3-1` 会变成"参数 `1-1` + 未知参数 `,3-1` ignored"，
+只剩第一个端口生效（kmsg 里有 `unknown parameter ',3-1' ignored` 就是踩了这个）。
+正确写法是让引号进到参数值里：
+
+```sh
+insmod dvb-usb-smit.ko 'reset_costly_ports="1-1 ,3-1"'
+```
+
 ### 顺带修掉的两个会把自愈拖崩的缺陷
 
 这两个是压测自愈时才暴露的，跟"复位要多久"直接相关：
